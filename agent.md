@@ -59,7 +59,7 @@ flowchart TD
     D --> E["Exact Match (Byte-level Duplicate Groups)"]
     D --> F{"Visual Similarity Enabled?"}
     F -->|Yes| G["Stage 5: Perceptual Hash (pHash 64-bit)<br/>(Representatives of full_hash + unique files)"]
-    G --> H["BK-Tree Nearest Neighbor Search<br/>(Hamming Distance <= Threshold)"]
+    G --> H["SIMD Vectorized Block Clustering<br/>(np.bitwise_count + Multi-threaded)"]
     H --> I["Union-Find Clustering<br/>(Visual Duplicate Groups)"]
     F -->|No| J["Done / Report Export"]
     I --> J
@@ -72,7 +72,7 @@ flowchart TD
 | **3. Prefix Hash** | Read first 64 KB $\rightarrow$ BLAKE2b hash | Low (Sequential read) | Files sharing exact byte size |
 | **4. Full Hash** | Stream whole file $\rightarrow$ BLAKE2b-128 hash | Moderate | Files sharing size & prefix hash |
 | **5. Visual Hash** | Image decode (`draft('L', (64,64))`) $\rightarrow$ pHash | High (CPU decoding) | Unique representative per exact group |
-| **6. Clustering** | BK-Tree index search + Union-Find | Low ($O(M \log M)$) | Representative pHash 64-bit integers |
+| **6. Clustering** | SIMD Vectorized Block Matrix + Union-Find | Very Low (Hardware SIMD Multi-threaded) | Representative pHash 64-bit uint64 |
 
 ### 3.2 Key Data Structures & Optimizations
 
@@ -82,10 +82,9 @@ flowchart TD
   - Transactions batched every 5,000 records (`BATCH = 5000`).
 - **Fast Image Downsampling**:
   - `im.draft('L', (64, 64))` is called before `imagehash.phash`, accelerating JPEG decoding significantly.
-- **Fast BK-Tree Metric Space Search**:
-  - 64-bit hashes stored as unsigned integers (`int(h, 16)`).
-  - Hamming distance calculated via `(h1 ^ h2).bit_count()` (native C speed in Python 3.10+).
-  - Prunes subtree branches outside `[d - threshold, d + threshold]`.
+- **Hardware SIMD Vectorized Multi-Threaded Clustering**:
+  - Employs NumPy 2.x `np.bitwise_count` leveraging CPU hardware SIMD (AVX2 / AVX-512 `POPCNT`) instructions.
+  - Divides 64-bit hash matrix into cache-friendly blocks ($2,000 \times 2,000$) and evaluates block pairs in parallel across user-configured worker threads.
 - **Windows OneDrive Placeholder Bypass**:
   - Checks Win32 attributes `FILE_ATTRIBUTE_OFFLINE (0x1000)`, `FILE_ATTRIBUTE_RECALL_ON_OPEN (0x40000)`, `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS (0x400000)` via `kernel32.GetFileAttributesW`. Prevents accidental cloud downloads.
 - **Large Image / Gigapixel Support**:

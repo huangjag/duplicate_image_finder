@@ -39,9 +39,10 @@ import sys
 import time
 import warnings
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 # 禁用大图像素上限限制及 DecompressionBomb 告警
@@ -507,53 +508,7 @@ def stage_full_hash(conn, workers, auto_skip_errors=False):
         hash_chunk, 'full', workers, '[4/5] 计算整文件哈希', auto_skip_errors=auto_skip_errors)
     return n, fails
 
-# ----------------------------- BK 树聚类 -----------------------------
-
-
-class _BKNode:
-    __slots__ = ('h', 'idxs', 'children')
-
-    def __init__(self, h, idx):
-        self.h = h
-        self.idxs = [idx]
-        self.children = {}
-
-
-class BKTree:
-    """迭代式 BK 树, 按汉明距离近邻查询; 相同哈希合并到一个节点"""
-
-    def __init__(self):
-        self.root = None
-
-    def insert(self, h, idx):
-        if self.root is None:
-            self.root = _BKNode(h, idx)
-            return
-        cur = self.root
-        while True:
-            d = (h ^ cur.h).bit_count()
-            if d == 0:
-                cur.idxs.append(idx)
-                return
-            nxt = cur.children.get(d)
-            if nxt is None:
-                cur.children[d] = _BKNode(h, idx)
-                return
-            cur = nxt
-
-    def query(self, h, threshold, out):
-        if self.root is None:
-            return
-        stack = [self.root]
-        while stack:
-            node = stack.pop()
-            d = (h ^ node.h).bit_count()
-            if d <= threshold:
-                out.extend(node.idxs)
-            lo, hi = d - threshold, d + threshold
-            for dd, child in node.children.items():
-                if lo <= dd <= hi:
-                    stack.append(child)
+# ----------------------------- 向量化并行聚类 -----------------------------
 
 
 class UnionFind:
@@ -578,8 +533,56 @@ class UnionFind:
             self.rank[ra] += 1
 
 
+def cluster_hashes_parallel(hashes_list, threshold, workers, progress_desc='[5/5] 相似哈希聚类'):
+    """
+    基于 NumPy C/SIMD 向量化 (POPCNT) 与多线程分块并行的快速汉明距离聚类。
+    线程池大小严格遵循用户设定的 workers 数量。
+    """
+    n = len(hashes_list)
+    if n < 2:
+        return UnionFind(n)
+
+    hashes_arr = np.array(hashes_list, dtype=np.uint64)
+    uf = UnionFind(n)
+
+    # 动态确定分块大小 (2000 保证 L2/L3 缓存友好与 SIMD 饱和)
+    block_size = 2000 if n > 4000 else max(100, n // max(1, workers))
+    num_blocks = (n + block_size - 1) // block_size
+
+    def compare_block_pair(p):
+        bi, bj = p
+        s1, e1 = bi * block_size, min((bi + 1) * block_size, n)
+        s2, e2 = bj * block_size, min((bj + 1) * block_size, n)
+        b1 = hashes_arr[s1:e1]
+        b2 = hashes_arr[s2:e2]
+        diff = np.bitwise_count(b1[:, None] ^ b2[None, :])
+        r, c = np.where(diff <= threshold)
+        if bi == bj:
+            mask = r < c
+            r, c = r[mask], c[mask]
+        if len(r) > 0:
+            return np.column_stack((r + s1, c + s2))
+        return None
+
+    block_pairs = [(bi, bj) for bi in range(num_blocks) for bj in range(bi, num_blocks)]
+    total_pairs = len(block_pairs)
+
+    bar = ProgressReporter(total_pairs, desc=progress_desc)
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for idx, res in enumerate(ex.map(compare_block_pair, block_pairs), 1):
+                if res is not None:
+                    for u, v in res:
+                        uf.union(int(u), int(v))
+                bar.update(1, current_file=f'正在并行计算第 {idx:,}/{total_pairs:,} 块矩阵 ({workers} 线程)')
+    finally:
+        bar.close()
+
+    return uf
+
+
 def stage_visual(conn, workers, threshold, skip_if_clean, auto_skip_errors=False):
-    """视觉相似检测: 对代表文件算 pHash, BK树聚类, 展开成组。返回 (新算哈希数, 组数)。"""
+    """视觉相似检测: 对代表文件算 pHash, 向量化并行聚类, 展开成组。返回 (新算哈希数, 组数)。"""
     conn.execute('DROP TABLE IF EXISTS reps')
     conn.execute(
         'CREATE TEMP TABLE reps AS '
@@ -609,18 +612,9 @@ def stage_visual(conn, workers, threshold, skip_if_clean, auto_skip_errors=False
 
     hashes = [int(h, 16) for _, h, _ in rep_rows]
     n = len(hashes)
-    uf = UnionFind(n)
-    tree = BKTree()
-    hits_buf = []
-    bar = ProgressReporter(n, '[5/5] BK树聚类')
-    for i in range(n):
-        hits_buf.clear()
-        tree.query(hashes[i], threshold, hits_buf)
-        for j in hits_buf:
-            uf.union(i, j)
-        tree.insert(hashes[i], i)
-        bar.update(1, current_file=f'正在聚类第 {i+1}/{n} 个哈希')
-    bar.close()
+
+    # 采用 NumPy SIMD 硬件级向量化 + 多线程并行计算 (使用用户指定的 workers 线程数)
+    uf = cluster_hashes_parallel(hashes, threshold, workers, progress_desc='[5/5] 相似哈希聚类')
 
     # 聚类结果 -> 代表索引
     clusters = defaultdict(list)
