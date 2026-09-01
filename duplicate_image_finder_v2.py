@@ -5,7 +5,9 @@
 =====================================================
 
 特性:
-  * 交互菜单: [1] 开始/继续查找(断点续扫)  [2] 重新扫描  [3] 导出列表(CSV+Markdown)  [4] 切换错误重试模式
+  * 交互菜单:
+      [1] 开始/继续查找(断点续扫)  [2] 重新扫描主库  [3] 导出列表(CSV+Markdown)
+      [4] 临时隔离扫描(不污染主库, 导出 _temp 报告)  [5] 优化与清理数据库  [6] 切换错误重试模式
   * 终端单行动态更新: 原地更新单行进度与当前文件，绝不换行滚动刷屏，保留全部历史日志
   * 智能断点续扫: 支持跳过磁盘重遍历，直达未完成阶段 (文件头/整文件/SIMD感知哈希聚类)
   * 容错与重试: 遇到读取失败时可暂停提示输入 'r' 重试，也可一键切换为自动跳过
@@ -18,15 +20,17 @@
     可识别重新压缩/改分辨率/加水印/改格式后肉眼相同的图片
 
 依赖:
-  pip install pillow imagehash tqdm
+  pip install pillow imagehash tqdm numpy
 
 用法:
   python duplicate_image_finder_v2.py                          # 交互菜单
-  python duplicate_image_finder_v2.py scan <目录>              # 续扫
+  python duplicate_image_finder_v2.py scan <目录>              # 续扫主库
+  python duplicate_image_finder_v2.py scan <目录> --temp       # 临时隔离扫描 (导出 _temp 报告)
   python duplicate_image_finder_v2.py scan <目录> --skip-walk  # 跳过磁盘遍历直达未完成阶段
   python duplicate_image_finder_v2.py scan <目录> --fresh      # 重新扫描
   python duplicate_image_finder_v2.py scan <目录> --no-visual  # 只查字节级重复
   python duplicate_image_finder_v2.py export                   # 导出报告
+  python duplicate_image_finder_v2.py clean-db                 # 优化与清理数据库
 """
 
 import argparse
@@ -67,6 +71,7 @@ if sys.platform == 'win32':
 
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.tif'}
 DB_FILENAME = 'image_dedup.db'
+TEMP_DB_FILENAME = 'image_dedup_temp.db'
 PREFIX_BYTES = 64 * 1024      # 文件头哈希的采样长度
 CHUNK_SIZE = 50               # 每个进程任务处理的文件数 (调小以高频平滑更新当前读取文件)
 BATCH = 5000                  # 数据库批量提交大小
@@ -244,6 +249,37 @@ def set_meta(conn, key, value):
 
 def db_file_count(conn):
     return conn.execute('SELECT COUNT(*) FROM files').fetchone()[0]
+
+
+def clean_database(db_path: str):
+    """清理并压缩优化 SQLite 数据库 (VACUUM & ANALYZE)"""
+    db_path = os.path.abspath(db_path)
+    if not os.path.exists(db_path):
+        print(f'数据库不存在: {db_path}')
+        return
+    size_before = os.path.getsize(db_path)
+    conn = open_db(db_path)
+    total_before = db_file_count(conn)
+    err_before = conn.execute('SELECT COUNT(*) FROM files WHERE error IS NOT NULL').fetchone()[0]
+    print('\n' + '=' * 50)
+    print(f'正在优化整理数据库: {os.path.basename(db_path)}')
+    print('=' * 50)
+    print(f'当前记录: {total_before:,} 个文件 (含 {err_before:,} 个错误记录)')
+    print(f'当前文件体积: {size_before / 1048576:.2f} MB')
+
+    t0 = time.time()
+    conn.execute('VACUUM')
+    conn.execute('ANALYZE')
+    conn.commit()
+    conn.close()
+
+    size_after = os.path.getsize(db_path)
+    freed = max(0, size_before - size_after)
+    print(f'\n[优化完成]')
+    print(f'  耗时:         {time.time() - t0:.2f} 秒')
+    print(f'  整理后体积:   {size_after / 1048576:.2f} MB')
+    print(f'  释放磁盘空间: {freed / 1048576:.2f} MB')
+    print('=' * 50)
 
 # ----------------------------- 目录遍历 -----------------------------
 
@@ -747,11 +783,13 @@ def iter_visual_groups(conn):
 # ----------------------------- 导出报告 -----------------------------
 
 
-def export_report(conn, out_dir, echo=True):
+def export_report(conn, out_dir, echo=True, suffix=''):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = out_dir / 'duplicates_report.csv'
-    md_path = out_dir / 'duplicates_report.md'
+    base_csv_name = f'duplicates_report{suffix}.csv'
+    base_md_name = f'duplicates_report{suffix}.md'
+    csv_path = out_dir / base_csv_name
+    md_path = out_dir / base_md_name
 
     sections = [
         (KIND_EXACT, list(iter_exact_groups(conn))),
@@ -763,8 +801,8 @@ def export_report(conn, out_dir, echo=True):
         f_csv = open(csv_path, 'w', encoding='utf-8-sig', newline='')
     except PermissionError:
         ts = time.strftime("%Y%m%d_%H%M%S")
-        csv_path = out_dir / f'duplicates_report_{ts}.csv'
-        print(f'\n[提示] 原 duplicates_report.csv 可能已被 Excel 打开占用，已自动写入新文件: {csv_path.name}')
+        csv_path = out_dir / f'duplicates_report{suffix}_{ts}.csv'
+        print(f'\n[提示] 原 {base_csv_name} 可能已被 Excel 打开占用，已自动写入新文件: {csv_path.name}')
         f_csv = open(csv_path, 'w', encoding='utf-8-sig', newline='')
 
     with f_csv:
@@ -784,7 +822,7 @@ def export_report(conn, out_dir, echo=True):
         f_md = open(md_path, 'w', encoding='utf-8')
     except PermissionError:
         ts = time.strftime("%Y%m%d_%H%M%S")
-        md_path = out_dir / f'duplicates_report_{ts}.md'
+        md_path = out_dir / f'duplicates_report{suffix}_{ts}.md'
         f_md = open(md_path, 'w', encoding='utf-8')
 
     with f_md:
@@ -825,7 +863,8 @@ def export_report(conn, out_dir, echo=True):
 # ----------------------------- 扫描主流程 -----------------------------
 
 
-def run_scan(root, db_path, fresh, visual, threshold, workers, interactive, auto_skip_errors=False, skip_walk=False):
+def run_scan(root, db_path, fresh, visual, threshold, workers, interactive,
+             auto_skip_errors=False, skip_walk=False, report_suffix=''):
     root = os.path.abspath(root)
     if not os.path.isdir(root):
         print(f'错误: 目录不存在 - {root}')
@@ -904,9 +943,46 @@ def run_scan(root, db_path, fresh, visual, threshold, workers, interactive, auto
     print('=' * 60)
 
     if interactive and input('\n是否现在导出报告 (CSV + Markdown)? [Y/n]: ').strip().lower() != 'n':
-        export_report(conn, os.path.dirname(db_abs) or '.', echo=True)
+        export_report(conn, os.path.dirname(db_abs) or '.', echo=True, suffix=report_suffix)
 
     conn.close()
+    return 0
+
+
+def run_temp_scan(root, db_dir='.', visual=True, threshold=DEFAULT_THRESHOLD, workers=4, auto_skip_errors=False):
+    """单次临时隔离扫描: 使用独立临时数据库, 导出 _temp 报告, 绝不污染主数据库"""
+    temp_db_path = os.path.abspath(os.path.join(db_dir, TEMP_DB_FILENAME))
+    print('\n' + '=' * 50)
+    print('        启动临时隔离扫描 (One-time Temp Scan)')
+    print('=' * 50)
+    print(f'临时数据库: {temp_db_path}')
+    print('说明: 此模式完全隔离，绝不影响主数据库文件')
+    print('-' * 50)
+
+    ret = run_scan(root, temp_db_path, fresh=True, visual=visual, threshold=threshold,
+                   workers=workers, interactive=False, auto_skip_errors=auto_skip_errors,
+                   skip_walk=False, report_suffix='_temp')
+    if ret != 0:
+        return ret
+
+    conn = open_db(temp_db_path)
+    try:
+        export_report(conn, db_dir, echo=True, suffix='_temp')
+    finally:
+        conn.close()
+
+    print('\n' + '-' * 50)
+    choice = input(f'临时扫描完成。是否删除临时数据库 ({TEMP_DB_FILENAME})? [Y/n]: ').strip().lower()
+    if choice != 'n':
+        for f in [temp_db_path, temp_db_path + '-wal', temp_db_path + '-shm']:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+        print('已安全清理临时数据库文件。')
+    else:
+        print(f'临时数据库已保留在: {temp_db_path}')
     return 0
 
 # ----------------------------- 交互菜单 -----------------------------
@@ -927,21 +1003,44 @@ def menu(db_path):
         print('\n' + '=' * 50)
         print('        重复图片查找工具 (海量文件版)')
         print('=' * 50)
-        print(f'缓存数据库: {db_path} (已索引 {n_files:,} 个文件)')
+        print(f'主缓存数据库: {db_path} (已索引 {n_files:,} 个文件)')
         print(f'上次扫描目录: {last_root or "未设置"}')
         mode_label = '自动跳过错误(不暂停)' if auto_skip_errors else '遇错暂停(提示输入 r 重试)'
         print(f'错误处理模式: {mode_label}')
         print('-' * 50)
-        print(' [1] 开始/继续查找重复项 (断点续扫)')
-        print(' [2] 重新扫描 (清空缓存)')
-        print(' [3] 导出重复文件列表 (CSV + Markdown)')
-        print(f' [4] 切换错误处理模式 (当前: {"自动跳过" if auto_skip_errors else "暂停重试"})')
+        print(' [1] 开始/继续查找重复项 (断点续扫主库)')
+        print(' [2] 重新扫描主库 (清空并重新扫描)')
+        print(' [3] 导出主库重复列表 (CSV + Markdown)')
+        print(' [4] 临时隔离扫描 (使用临时数据库, 不污染主库, 导出 _temp 报告)')
+        print(' [5] 优化与清理数据库 (VACUUM 整理碎片 & 索引优化)')
+        print(f' [6] 切换错误处理模式 (当前: {"自动跳过" if auto_skip_errors else "暂停重试"})')
         print(' [0] 退出')
         choice = input('请选择: ').strip()
 
         if choice == '0':
             break
         elif choice == '4':
+            root = prompt('临时扫描目录', last_root or '.')
+            workers_default = 4
+            try:
+                workers = int(prompt('并行进程数', workers_default))
+            except ValueError:
+                workers = workers_default
+            visual = prompt('检测视觉相似图片? (重新压缩/改尺寸副本, y/n)', 'y').lower() != 'n'
+            try:
+                threshold = int(prompt('视觉相似汉明距离阈值 (0-64, 越小越严格)', DEFAULT_THRESHOLD))
+            except ValueError:
+                threshold = DEFAULT_THRESHOLD
+            threshold = max(0, min(64, threshold))
+            db_dir = os.path.dirname(os.path.abspath(db_path)) or '.'
+            try:
+                run_temp_scan(root, db_dir=db_dir, visual=visual, threshold=threshold,
+                              workers=workers, auto_skip_errors=auto_skip_errors)
+            except KeyboardInterrupt:
+                print('\n临时扫描已中断。')
+        elif choice == '5':
+            clean_database(db_path)
+        elif choice == '6':
             auto_skip_errors = not auto_skip_errors
             if auto_skip_errors:
                 print('\n[已设置] 遇到读取错误时将【自动跳过并记录】，不暂停重试。')
@@ -951,7 +1050,7 @@ def menu(db_path):
         elif choice in ('1', '2'):
             fresh = choice == '2'
             if fresh and n_files > 0:
-                if input('确认清空缓存并重新扫描? (yes/no): ').strip().lower() != 'yes':
+                if input('确认清空缓存并重新扫描主库? (yes/no): ').strip().lower() != 'yes':
                     continue
             root = prompt('扫描目录', last_root or '.')
             workers_default = 4
@@ -1010,20 +1109,32 @@ def main():
     p_scan.add_argument('--workers', type=int, default=4)
     p_scan.add_argument('--auto-skip-errors', action='store_true', help='遇到错误自动跳过，不暂停要求输入r重试')
     p_scan.add_argument('--skip-walk', action='store_true', help='跳过磁盘遍历，直接对数据库已有文件继续哈希/聚类')
+    p_scan.add_argument('--temp', action='store_true', help='临时隔离扫描模式 (使用临时数据库，导出 _temp 报告，不污染主库)')
 
     sub.add_parser('export', help='导出重复列表 (CSV + Markdown)')
+    sub.add_parser('clean-db', help='优化并整理数据库碎片 (VACUUM & ANALYZE)')
 
     args = parser.parse_args()
 
     if args.cmd == 'scan':
-        try:
-            sys.exit(run_scan(args.root, args.db, args.fresh, not args.no_visual,
-                              args.threshold, args.workers, interactive=False,
-                              auto_skip_errors=args.auto_skip_errors,
-                              skip_walk=args.skip_walk))
-        except KeyboardInterrupt:
-            print('\n已中断。下次运行可断点续扫。')
-            sys.exit(130)
+        if args.temp:
+            db_dir = os.path.dirname(os.path.abspath(args.db)) or '.'
+            try:
+                sys.exit(run_temp_scan(args.root, db_dir=db_dir, visual=not args.no_visual,
+                                       threshold=args.threshold, workers=args.workers,
+                                       auto_skip_errors=args.auto_skip_errors))
+            except KeyboardInterrupt:
+                print('\n临时扫描已中断。')
+                sys.exit(130)
+        else:
+            try:
+                sys.exit(run_scan(args.root, args.db, args.fresh, not args.no_visual,
+                                  args.threshold, args.workers, interactive=False,
+                                  auto_skip_errors=args.auto_skip_errors,
+                                  skip_walk=args.skip_walk))
+            except KeyboardInterrupt:
+                print('\n已中断。下次运行可断点续扫。')
+                sys.exit(130)
     elif args.cmd == 'export':
         conn = open_db(os.path.abspath(args.db))
         try:
@@ -1033,6 +1144,8 @@ def main():
             export_report(conn, os.path.dirname(os.path.abspath(args.db)) or '.')
         finally:
             conn.close()
+    elif args.cmd == 'clean-db':
+        clean_database(args.db)
     else:
         try:
             menu(args.db)

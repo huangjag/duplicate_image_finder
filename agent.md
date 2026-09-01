@@ -146,19 +146,27 @@ Run without arguments to launch the interactive terminal menu:
 python duplicate_image_finder_v2.py
 ```
 Menu options:
-- `[1]`: Start / Resume duplicate search (breakpoint continuation).
-- `[2]`: Fresh scan (clears database cache).
-- `[3]`: Export duplicate reports (CSV + Markdown).
-- `[4]`: Toggle error handling mode (Pause for `r` retry vs. Auto-skip errors).
+- `[1]`: Start / Resume duplicate search on main database (breakpoint continuation).
+- `[2]`: Fresh scan main database (clears and rebuilds cache).
+- `[3]`: Export main duplicate reports (CSV + Markdown).
+- `[4]`: Temporary isolated scan (runs in `image_dedup_temp.db` without contaminating main DB, exports `_temp` reports).
+- `[5]`: Optimize & clean database (defragments SQLite pages via `VACUUM` & rebuilds statistics via `ANALYZE`).
+- `[6]`: Toggle error handling mode (Pause for `r` retry vs. Auto-skip errors).
 - `[0]`: Exit.
 
 #### Command-Line Mode
 ```bash
-# Resume or start scan on target directory
+# Resume or start scan on target directory (main database)
 python duplicate_image_finder_v2.py scan "E:\photos"
+
+# Temporary isolated scan (one-time test scan, exports _temp reports)
+python duplicate_image_finder_v2.py scan "E:\photos" --temp
 
 # Fresh scan (wipe cache and rescan)
 python duplicate_image_finder_v2.py scan "E:\photos" --fresh
+
+# Skip directory walking and directly continue unfinished hashing/clustering
+python duplicate_image_finder_v2.py scan "E:\photos" --skip-walk
 
 # Automatic error skipping without pausing for retry
 python duplicate_image_finder_v2.py scan "E:\photos" --auto-skip-errors
@@ -171,11 +179,14 @@ python duplicate_image_finder_v2.py scan "E:\photos" --threshold 6 --workers 8
 
 # Export reports from existing database without rescanning
 python duplicate_image_finder_v2.py export
+
+# Optimize and defragment SQLite database
+python duplicate_image_finder_v2.py clean-db
 ```
 
 #### Output Artifacts:
-- `duplicates_report.csv`: UTF-8 with BOM (compatible with Microsoft Excel), formatted horizontally as: `filename, dup_path_1, dup_path_2, dup_path_3, ...`.
-- `duplicates_report.md`: Markdown summary and grouped duplicate listings with file sizes.
+- `duplicates_report.csv` / `duplicates_report_temp.csv`: UTF-8 with BOM (compatible with Microsoft Excel), formatted horizontally as: `filename, dup_path_1, dup_path_2, dup_path_3, ...`.
+- `duplicates_report.md` / `duplicates_report_temp.md`: Markdown summary and grouped duplicate listings with file sizes.
 
 ---
 
