@@ -8,18 +8,12 @@ This document serves as the primary technical reference and architectural guide 
 
 ## 1. Project Overview
 
-The project provides dual implementations catering to different scale requirements:
-
-1. **`duplicate_image_finder_v2.py` (Primary / Production)**:
-   - Built specifically for massive image datasets (100k~1M+ files).
-   - Employs a **5-stage hierarchical funnel architecture** (inspired by tools like `Czkawka` and `fclones`).
-   - SQLite WAL-mode persistence for full **breakpoint resumption** and zero-overhead **incremental scanning**.
-   - Multi-process parallel hashing (`ProcessPoolExecutor`) and sub-quadratic metric space search via **BK-Tree** and **Union-Find** clustering.
-   - Platform-aware (detects and skips Windows OneDrive cloud-only placeholder files).
-
-2. **`duplicate_image_finder.py` (v1 / Utility)**:
-   - Lightweight, standalone script for small datasets (<10k images).
-   - Provides pairwise $O(N^2)$ distance matrices, multiple perceptual hash algorithms (`phash`, `ahash`, `dhash`, `whash`), and interactive file deletion modes (`--delete`, `--keep first|largest|resolution`, `--no-dry-run`).
+`duplicate_image_finder_v2.py` is the production duplicate image detection system:
+- Built specifically for massive image datasets (100k~1M+ files).
+- Employs a **4-stage hierarchical funnel architecture** (inspired by tools like `Czkawka` and `fclones`).
+- SQLite WAL-mode persistence for full **breakpoint resumption** and zero-overhead **incremental scanning**.
+- Multi-process parallel hashing (`ProcessPoolExecutor`) and hardware SIMD vectorized multi-threaded clustering (`np.bitwise_count` + `UnionFind`).
+- Platform-aware (detects and skips Windows OneDrive cloud-only placeholder files).
 
 ---
 
@@ -28,17 +22,13 @@ The project provides dual implementations catering to different scale requiremen
 ```
 duplicate_image_finder/
 │
-├── duplicate_image_finder_v2.py      # [Main] Scalable, multi-process duplicate finder with SQLite & BK-tree
-├── duplicate_image_finder.py         # [v1] Lightweight standalone script with direct deletion support
+├── duplicate_image_finder_v2.py      # [Main] Production duplicate finder with SQLite & SIMD clustering
 │
-├── requirements.txt                  # Production dependencies (pillow, imagehash, tqdm)
-├── dependencies.md                   # Detailed environment and deployment guide (online/offline/Pillow-SIMD)
-├── duplicate_image_finder_readme.md  # User documentation for v1 script
-├── chat_history_2026-09-01_17-21.md  # Architecture design decisions and historical chat context
+├── requirements.txt                  # Production dependencies (pillow, imagehash, tqdm, numpy)
+├── dependencies.md                   # Environment and deployment guide
+├── chat_history_2026-09-01_17-21.md  # Historical chat log
 │
 ├── image_dedup.db                    # SQLite cache database (created/updated at runtime)
-├── image_dedup.db-wal                # SQLite Write-Ahead Log (runtime temporary)
-├── image_dedup.db-shm                # SQLite Shared-Memory index (runtime temporary)
 │
 └── agent.md                          # [This file] Developer and AI agent reference manual
 ```
@@ -186,24 +176,6 @@ python duplicate_image_finder_v2.py export
 #### Output Artifacts:
 - `duplicates_report.csv`: UTF-8 with BOM (compatible with Microsoft Excel), formatted horizontally as: `filename, dup_path_1, dup_path_2, dup_path_3, ...`.
 - `duplicates_report.md`: Markdown summary and grouped duplicate listings with file sizes.
-
----
-
-### 6.2 `duplicate_image_finder.py` (v1)
-
-```bash
-# Basic scan with pHash
-python duplicate_image_finder.py /path/to/photos
-
-# Use dHash with strict threshold
-python duplicate_image_finder.py /path/to/photos -a dhash -t 8 -v
-
-# Safe dry-run deletion preview
-python duplicate_image_finder.py /path/to/photos --delete --keep largest
-
-# Execute real deletion
-python duplicate_image_finder.py /path/to/photos --delete --keep largest --no-dry-run
-```
 
 ---
 
