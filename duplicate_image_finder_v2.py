@@ -9,12 +9,11 @@
   * 终端单行动态更新: 原地更新单行进度与当前文件，绝不换行滚动刷屏，保留全部历史日志
   * 智能断点续扫: 支持跳过磁盘重遍历，直达未完成阶段 (文件头/整文件/SIMD感知哈希聚类)
   * 容错与重试: 遇到读取失败时可暂停提示输入 'r' 重试，也可一键切换为自动跳过
-  * 分级漏斗加速: 文件名 -> 文件大小 -> 文件头哈希 -> 整文件哈希 -> (可选)感知哈希
+  * 分级漏斗加速: 文件大小 -> 文件头哈希 (64KB) -> 整文件哈希 (BLAKE2b-128) -> (可选)感知哈希 (pHash)
   * NumPy SIMD 硬件级向量化 (POPCNT) 多线程块并行快速相似聚类
 
 重复类型:
-  * 文件名重复: 基础文件名相同(不区分大小写), 与内容无关
-  * 内容重复:   字节级完全一致(整文件 BLAKE2b-128 哈希)
+  * 内容重复:   字节级完全一致(整文件 BLAKE2b-128 哈希, 零误报, 安全去重)
   * 视觉相似(可选): pHash 64位指纹 + SIMD 向量化并行聚类,
     可识别重新压缩/改分辨率/加水印/改格式后肉眼相同的图片
 
@@ -74,7 +73,6 @@ BATCH = 5000                  # 数据库批量提交大小
 HASH_SIZE = 8                 # pHash 8x8 = 64 位指纹
 DEFAULT_THRESHOLD = 6         # 汉明距离阈值(0=完全一致, 建议 5~8)
 
-KIND_NAME = '文件名重复'
 KIND_EXACT = '内容重复'
 KIND_VISUAL = '视觉相似'
 
@@ -220,7 +218,6 @@ CREATE TABLE IF NOT EXISTS files(
 );
 CREATE INDEX IF NOT EXISTS ix_files_size ON files(size);
 CREATE INDEX IF NOT EXISTS ix_files_size_prefix ON files(size, prefix_hash);
-CREATE INDEX IF NOT EXISTS ix_files_name ON files(name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS ix_files_full ON files(full_hash);
 CREATE INDEX IF NOT EXISTS ix_files_vg   ON files(visual_group);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -311,7 +308,7 @@ def enumerate_into_db(conn, root: str, db_abs: str, auto_skip_errors: bool = Fal
         conn.commit()
         batch.clear()
 
-    bar = SingleLineReporter(0, '[1/5] 遍历目录')
+    bar = SingleLineReporter(0, '[1/4] 遍历目录')
     try:
         for path in walk_images(root):
             if os.path.abspath(path) == db_abs:
@@ -512,7 +509,7 @@ def stage_prefix_hash(conn, workers, auto_skip_errors=False):
         conn,
         'SELECT f.id, f.path FROM files f JOIN dup_sizes d ON f.size=d.size '
         'WHERE f.prefix_hash IS NULL AND f.error IS NULL',
-        hash_chunk, 'prefix', workers, '[3/5] 计算文件头哈希', auto_skip_errors=auto_skip_errors)
+        hash_chunk, 'prefix', workers, '[2/4] 计算文件头哈希', auto_skip_errors=auto_skip_errors)
     return n, fails
 
 
@@ -535,7 +532,7 @@ def stage_full_hash(conn, workers, auto_skip_errors=False):
         'SELECT f.id, f.path FROM files f JOIN dup_prefix d '
         'ON f.size=d.size AND f.prefix_hash=d.prefix_hash '
         'WHERE f.full_hash IS NULL AND f.error IS NULL',
-        hash_chunk, 'full', workers, '[4/5] 计算整文件哈希', auto_skip_errors=auto_skip_errors)
+        hash_chunk, 'full', workers, '[3/4] 计算整文件哈希', auto_skip_errors=auto_skip_errors)
     return n, fails
 
 # ----------------------------- 向量化并行聚类 -----------------------------
@@ -563,7 +560,7 @@ class UnionFind:
             self.rank[ra] += 1
 
 
-def cluster_hashes_parallel(hashes_list, threshold, workers, progress_desc='[5/5] 相似哈希聚类'):
+def cluster_hashes_parallel(hashes_list, threshold, workers, progress_desc='[4/4] 相似哈希聚类'):
     """
     基于 NumPy C/SIMD 向量化 (POPCNT) 与多线程分块并行的快速汉明距离聚类。
     线程池大小严格遵循用户设定的 workers 数量。
@@ -624,7 +621,7 @@ def stage_visual(conn, workers, threshold, skip_if_clean, auto_skip_errors=False
     n_new, fails, _ = _run_stage(
         conn,
         'SELECT r.id, f.path FROM reps r JOIN files f ON f.id=r.id WHERE f.phash IS NULL',
-        phash_chunk, None, workers, '[5/5] 计算感知哈希 pHash', auto_skip_errors=auto_skip_errors)
+        phash_chunk, None, workers, '[4/4] 计算感知哈希 pHash', auto_skip_errors=auto_skip_errors)
     if fails:
         print(f'[提示] {fails} 张图片无法解码, 已记录错误并跳过')
 
@@ -645,7 +642,7 @@ def stage_visual(conn, workers, threshold, skip_if_clean, auto_skip_errors=False
     n = len(hashes)
 
     # 采用 NumPy SIMD 硬件级向量化 + 多线程并行计算 (使用用户指定的 workers 线程数)
-    uf = cluster_hashes_parallel(hashes, threshold, workers, progress_desc='[5/5] 相似哈希聚类')
+    uf = cluster_hashes_parallel(hashes, threshold, workers, progress_desc='[4/4] 相似哈希聚类')
 
     # 聚类结果 -> 代表索引
     clusters = defaultdict(list)
@@ -703,30 +700,6 @@ def show_group(kind, name, paths):
     print('\n'.join(lines) + '\n')
 
 
-def iter_name_groups(conn):
-    """查询文件名重复组。使用 SQL GROUP BY HAVING 仅筛选存在重复的组"""
-    sql = """
-    SELECT f.id, f.name, f.path, f.size
-    FROM files f
-    JOIN (
-        SELECT name FROM files
-        GROUP BY name COLLATE NOCASE
-        HAVING COUNT(*) > 1
-    ) d ON f.name = d.name COLLATE NOCASE
-    ORDER BY f.name COLLATE NOCASE, f.id
-    """
-    cur = conn.execute(sql)
-    group = []
-    for row in cur:
-        if group and row[1].lower() != group[-1][1].lower():
-            if len(group) > 1:
-                yield group
-            group = []
-        group.append(row)
-    if len(group) > 1:
-        yield group
-
-
 def iter_exact_groups(conn):
     """查询内容完全一致(整文件哈希相同)的重复组"""
     sql = """
@@ -781,14 +754,21 @@ def export_report(conn, out_dir, echo=True):
     md_path = out_dir / 'duplicates_report.md'
 
     sections = [
-        (KIND_NAME, list(iter_name_groups(conn))),
         (KIND_EXACT, list(iter_exact_groups(conn))),
         (KIND_VISUAL, list(iter_visual_groups(conn))),
     ]
 
     import csv as _csv
-    with open(csv_path, 'w', encoding='utf-8-sig', newline='') as f:
-        w = _csv.writer(f)
+    try:
+        f_csv = open(csv_path, 'w', encoding='utf-8-sig', newline='')
+    except PermissionError:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        csv_path = out_dir / f'duplicates_report_{ts}.csv'
+        print(f'\n[提示] 原 duplicates_report.csv 可能已被 Excel 打开占用，已自动写入新文件: {csv_path.name}')
+        f_csv = open(csv_path, 'w', encoding='utf-8-sig', newline='')
+
+    with f_csv:
+        w = _csv.writer(f_csv)
         for kind, groups in sections:
             if not groups:
                 continue
@@ -799,24 +779,32 @@ def export_report(conn, out_dir, echo=True):
 
     root = get_meta(conn, 'root', '?')
     total_files = db_file_count(conn)
-    with open(md_path, 'w', encoding='utf-8') as f:
-        f.write('# 重复图片报告\n\n')
-        f.write(f'- 扫描目录: `{root}`\n')
-        f.write(f'- 生成时间: {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
-        f.write(f'- 索引文件总数: {total_files:,}\n')
+
+    try:
+        f_md = open(md_path, 'w', encoding='utf-8')
+    except PermissionError:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        md_path = out_dir / f'duplicates_report_{ts}.md'
+        f_md = open(md_path, 'w', encoding='utf-8')
+
+    with f_md:
+        f_md.write('# 重复图片报告\n\n')
+        f_md.write(f'- 扫描目录: `{root}`\n')
+        f_md.write(f'- 生成时间: {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
+        f_md.write(f'- 索引文件总数: {total_files:,}\n')
         for kind, groups in sections:
             n_files = sum(len(g) for g in groups)
-            f.write(f'- {kind}: {len(groups):,} 组, 涉及 {n_files:,} 个文件\n')
+            f_md.write(f'- {kind}: {len(groups):,} 组, 涉及 {n_files:,} 个文件\n')
         for kind, groups in sections:
             if not groups:
                 continue
-            f.write(f'\n## {kind} ({len(groups):,} 组)\n')
+            f_md.write(f'\n## {kind} ({len(groups):,} 组)\n')
             for gi, group in enumerate(groups, 1):
                 label = group[0][1]
-                f.write(f'\n### 组 {gi}: `{label}` ({len(group)} 份)\n\n')
+                f_md.write(f'\n### 组 {gi}: `{label}` ({len(group)} 份)\n\n')
                 for i, row in enumerate(group, 1):
-                    f.write(f'- 路径 {i}: `{row[2]}` ({row[3]:,} 字节)\n')
-                f.write('\n')
+                    f_md.write(f'- 路径 {i}: `{row[2]}` ({row[3]:,} 字节)\n')
+                f_md.write('\n')
 
     if echo:
         print('\n' + '=' * 60)
@@ -868,7 +856,7 @@ def run_scan(root, db_path, fresh, visual, threshold, workers, interactive, auto
     if skip_walk and db_file_count(conn) > 0:
         total = db_file_count(conn)
         changed_total = 0
-        print(f'[1/5] 遍历目录: 已跳过 (直接使用数据库已有的 {total:,} 个文件索引)')
+        print(f'[1/4] 遍历目录: 已跳过 (直接使用数据库已有的 {total:,} 个文件索引)')
     else:
         total, added, changed, deleted, ph_skip, stat_err = enumerate_into_db(
             conn, root, db_abs, auto_skip_errors=auto_skip_errors)
@@ -879,16 +867,12 @@ def run_scan(root, db_path, fresh, visual, threshold, workers, interactive, auto
         print('文件不足, 无需比较。')
         return 0
 
-    print('\n[2/5] 检查文件名重复')
-    name_groups = list(iter_name_groups(conn))
-    print(f'  文件名重复: {len(name_groups):,} 组')
-
-    print('\n[3/5] 计算文件头哈希 (仅大小重复的文件)')
+    print('\n[2/4] 计算文件头哈希 (仅大小重复的文件)')
     n, fails = stage_prefix_hash(conn, workers, auto_skip_errors=auto_skip_errors)
     if n > 0:
         print(f'  处理完成: {n:,} 个文件, 失败 {fails:,}')
 
-    print('\n[4/5] 计算整文件哈希 (仅头部冲突的文件)')
+    print('\n[3/4] 计算整文件哈希 (仅头部冲突的文件)')
     n, fails = stage_full_hash(conn, workers, auto_skip_errors=auto_skip_errors)
     exact_groups = list(iter_exact_groups(conn))
     if n > 0:
@@ -897,13 +881,13 @@ def run_scan(root, db_path, fresh, visual, threshold, workers, interactive, auto
         print(f'  内容重复: {len(exact_groups):,} 组')
 
     if visual:
-        print(f'\n[5/5] 视觉相似检测 (pHash, 阈值 {threshold})')
+        print(f'\n[4/4] 视觉相似检测 (pHash, 阈值 {threshold})')
         n_new, v_groups = stage_visual(conn, workers, threshold,
                                        skip_if_clean=(changed_total == 0),
                                        auto_skip_errors=auto_skip_errors)
         print(f'  处理完成: 新算 {n_new:,} 张图片 | 视觉相似: {v_groups:,} 组')
     else:
-        print('\n[5/5] 视觉相似检测: 已跳过 (--no-visual)')
+        print('\n[4/4] 视觉相似检测: 已跳过 (--no-visual)')
 
     # 汇总: 每组保留一份, 其余为冗余
     redundant_files = sum(len(g) - 1 for g in exact_groups)
@@ -911,7 +895,6 @@ def run_scan(root, db_path, fresh, visual, threshold, workers, interactive, auto
     print('\n' + '=' * 60)
     print(f'扫描完成, 耗时 {time.time() - t0:.1f} 秒')
     print(f'  索引文件总数:  {total:,}')
-    print(f'  文件名重复组:  {len(name_groups):,} 组')
     print(f'  内容重复组:    {len(exact_groups):,} 组 (冗余 {redundant_files:,} 个文件, '
           f'可释放约 {redundant_bytes / 1048576:.1f} MB)')
     if visual:

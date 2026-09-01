@@ -53,26 +53,23 @@ To avoid computing expensive image decodings and perceptual hashes across millio
 
 ```mermaid
 flowchart TD
-    A["Stage 1: Enumerate Directory<br/>(os.scandir + SQLite sync + OneDrive filter)"] --> B["Stage 2: Check Filename Duplicates<br/>(GROUP BY name COLLATE NOCASE)"]
-    A --> C["Stage 3: Prefix Hash (64 KB BLAKE2b)<br/>(Filtered: Size duplicates only)"]
-    C --> D["Stage 4: Full File Hash (BLAKE2b-128)<br/>(Filtered: Prefix hash conflicts only)"]
-    D --> E["Exact Match (Byte-level Duplicate Groups)"]
-    D --> F{"Visual Similarity Enabled?"}
-    F -->|Yes| G["Stage 5: Perceptual Hash (pHash 64-bit)<br/>(Representatives of full_hash + unique files)"]
-    G --> H["SIMD Vectorized Block Clustering<br/>(np.bitwise_count + Multi-threaded)"]
-    H --> I["Union-Find Clustering<br/>(Visual Duplicate Groups)"]
-    F -->|No| J["Done / Report Export"]
-    I --> J
+    A["Stage 1: Enumerate Directory<br/>(os.scandir + SQLite sync + OneDrive filter)"] --> B["Stage 2: Prefix Hash (64 KB BLAKE2b)<br/>(Filtered: Size duplicates only)"]
+    B --> C["Stage 3: Full File Hash (BLAKE2b-128)<br/>(Filtered: Prefix hash conflicts only)"]
+    C --> D["Exact Match (Byte-level Duplicate Groups)"]
+    C --> E{"Visual Similarity Enabled?"}
+    E -->|Yes| F["Stage 4: Perceptual Hash (pHash 64-bit)<br/>(Representatives of full_hash + unique files)"]
+    F --> G["SIMD Vectorized Block Clustering<br/>(np.bitwise_count + Multi-threaded)"]
+    G --> H["Union-Find Clustering<br/>(Visual Duplicate Groups)"]
+    E -->|No| I["Done / Report Export"]
+    H --> I
 ```
 
 | Stage | Operation | Computation Cost | Target Set / Filter |
 |---|---|---|---|
 | **1. Enumerate** | Recursive scan + metadata sync `(size, mtime)` | Low (Disk I/O) | All files in directory |
-| **2. Name Duplicates** | SQL `GROUP BY name COLLATE NOCASE` | Negligible | All indexed files |
-| **3. Prefix Hash** | Read first 64 KB $\rightarrow$ BLAKE2b hash | Low (Sequential read) | Files sharing exact byte size |
-| **4. Full Hash** | Stream whole file $\rightarrow$ BLAKE2b-128 hash | Moderate | Files sharing size & prefix hash |
-| **5. Visual Hash** | Image decode (`draft('L', (64,64))`) $\rightarrow$ pHash | High (CPU decoding) | Unique representative per exact group |
-| **6. Clustering** | SIMD Vectorized Block Matrix + Union-Find | Very Low (Hardware SIMD Multi-threaded) | Representative pHash 64-bit uint64 |
+| **2. Prefix Hash** | Read first 64 KB $\rightarrow$ BLAKE2b hash | Low (Sequential read) | Files sharing exact byte size |
+| **3. Full Hash** | Stream whole file $\rightarrow$ BLAKE2b-128 hash | Moderate | Files sharing size & prefix hash |
+| **4. Visual Hash & Cluster** | Image decode $\rightarrow$ pHash 64-bit $\rightarrow$ SIMD Block Clustering | High (Decode) / Fast (Cluster) | Unique representative per exact group |
 
 ### 3.2 Key Data Structures & Optimizations
 
