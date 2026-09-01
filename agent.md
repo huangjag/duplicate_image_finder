@@ -110,6 +110,7 @@ CREATE TABLE IF NOT EXISTS files (
 );
 
 CREATE INDEX IF NOT EXISTS ix_files_size ON files(size);
+CREATE INDEX IF NOT EXISTS ix_files_size_prefix ON files(size, prefix_hash);
 CREATE INDEX IF NOT EXISTS ix_files_name ON files(name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS ix_files_full ON files(full_hash);
 CREATE INDEX IF NOT EXISTS ix_files_vg   ON files(visual_group);
@@ -183,8 +184,8 @@ python duplicate_image_finder_v2.py export
 ```
 
 #### Output Artifacts:
-- `duplicates_report.csv`: UTF-8 with BOM (compatible with Microsoft Excel), containing columns: `组编号`, `类型`, `参考文件名`, `序号`, `文件路径`, `文件大小(字节)`.
-- `duplicates_report.md`: Markdown summary and grouped duplicate listings.
+- `duplicates_report.csv`: UTF-8 with BOM (compatible with Microsoft Excel), formatted horizontally as: `filename, dup_path_1, dup_path_2, dup_path_3, ...`.
+- `duplicates_report.md`: Markdown summary and grouped duplicate listings with file sizes.
 
 ---
 

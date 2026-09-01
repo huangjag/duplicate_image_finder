@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS files(
     error       TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_files_size ON files(size);
+CREATE INDEX IF NOT EXISTS ix_files_size_prefix ON files(size, prefix_hash);
 CREATE INDEX IF NOT EXISTS ix_files_name ON files(name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS ix_files_full ON files(full_hash);
 CREATE INDEX IF NOT EXISTS ix_files_vg   ON files(visual_group);
@@ -527,15 +528,28 @@ def stage_visual(conn, workers, threshold, skip_if_clean):
 
 
 def show_group(kind, name, paths):
-    lines = [f'--{name}  [{kind}]']
-    lines.extend(paths)
+    """格式化输出单组重复图片"""
+    lines = [f'[{kind}] {name} ({len(paths)} 份):']
+    for i, p in enumerate(paths, 1):
+        lines.append(f'  dup path{i}: {p}')
     tqdm.write('\n'.join(lines) + '\n')
 
 
 def iter_name_groups(conn):
-    rows = conn.execute('SELECT id, name, path, size FROM files ORDER BY name COLLATE NOCASE, id').fetchall()
+    """查询文件名重复组。使用 SQL GROUP BY HAVING 仅筛选存在重复的组"""
+    sql = """
+    SELECT f.id, f.name, f.path, f.size
+    FROM files f
+    JOIN (
+        SELECT name FROM files
+        GROUP BY name COLLATE NOCASE
+        HAVING COUNT(*) > 1
+    ) d ON f.name = d.name COLLATE NOCASE
+    ORDER BY f.name COLLATE NOCASE, f.id
+    """
+    cur = conn.execute(sql)
     group = []
-    for row in rows:
+    for row in cur:
         if group and row[1].lower() != group[-1][1].lower():
             if len(group) > 1:
                 yield group
@@ -546,10 +560,21 @@ def iter_name_groups(conn):
 
 
 def iter_exact_groups(conn):
-    rows = conn.execute('SELECT id, name, path, size, full_hash FROM files '
-                        'WHERE full_hash IS NOT NULL ORDER BY full_hash, id').fetchall()
+    """查询内容完全一致(整文件哈希相同)的重复组"""
+    sql = """
+    SELECT f.id, f.name, f.path, f.size, f.full_hash
+    FROM files f
+    JOIN (
+        SELECT full_hash FROM files
+        WHERE full_hash IS NOT NULL
+        GROUP BY full_hash
+        HAVING COUNT(*) > 1
+    ) d ON f.full_hash = d.full_hash
+    ORDER BY f.full_hash, f.id
+    """
+    cur = conn.execute(sql)
     group = []
-    for row in rows:
+    for row in cur:
         if group and row[4] != group[-1][4]:
             if len(group) > 1:
                 yield group
@@ -560,10 +585,16 @@ def iter_exact_groups(conn):
 
 
 def iter_visual_groups(conn):
-    rows = conn.execute('SELECT id, name, path, size, visual_group FROM files '
-                        'WHERE visual_group IS NOT NULL ORDER BY visual_group, id').fetchall()
+    """查询感知哈希视觉相似组"""
+    sql = """
+    SELECT f.id, f.name, f.path, f.size, f.visual_group
+    FROM files f
+    WHERE f.visual_group IS NOT NULL
+    ORDER BY f.visual_group, f.id
+    """
+    cur = conn.execute(sql)
     group = []
-    for row in rows:
+    for row in cur:
         if group and row[4] != group[-1][4]:
             if len(group) > 1:
                 yield group
@@ -591,12 +622,13 @@ def export_report(conn, out_dir, echo=True):
     import csv as _csv
     with open(csv_path, 'w', encoding='utf-8-sig', newline='') as f:
         w = _csv.writer(f)
-        w.writerow(['组编号', '类型', '参考文件名', '序号', '文件路径', '文件大小(字节)'])
         for kind, groups in sections:
-            for gi, group in enumerate(groups, 1):
+            if not groups:
+                continue
+            for group in groups:
                 label = group[0][1]
-                for si, row in enumerate(group, 1):
-                    w.writerow([gi, kind, label, si, row[2], row[3]])
+                paths = [row[2] for row in group]
+                w.writerow([label] + paths)
 
     root = get_meta(conn, 'root', '?')
     total_files = db_file_count(conn)
@@ -609,27 +641,30 @@ def export_report(conn, out_dir, echo=True):
             n_files = sum(len(g) for g in groups)
             f.write(f'- {kind}: {len(groups)} 组, 涉及 {n_files} 个文件\n')
         for kind, groups in sections:
+            if not groups:
+                continue
             f.write(f'\n## {kind} ({len(groups)} 组)\n')
             for gi, group in enumerate(groups, 1):
                 label = group[0][1]
-                f.write(f'\n### 组 {gi}\n\n')
-                f.write(f'--{label}\n\n')
-                for row in group:
-                    f.write(f'{row[2]}\n')
+                f.write(f'\n### 组 {gi}: `{label}` ({len(group)} 份)\n\n')
+                for i, row in enumerate(group, 1):
+                    f.write(f'- 路径 {i}: `{row[2]}` ({row[3]:,} 字节)\n')
                 f.write('\n')
 
     if echo:
         print('\n' + '=' * 60)
-        print('重复文件清单 (与实时显示格式一致)')
+        print('重复文件清单摘要 (完整清单见导出的 CSV / Markdown 报告)')
         print('=' * 60)
         for kind, groups in sections:
-            print(f'\n===== {kind}: {len(groups)} 组 =====')
-            for group in groups:
+            print(f'\n===== {kind}: 共 {len(groups)} 组 =====')
+            for group in groups[:5]:
                 show_group(kind, group[0][1], [r[2] for r in group])
+            if len(groups) > 5:
+                print(f'  ... 其余 {len(groups) - 5} 组已写入报告文件 ...\n')
 
     print(f'\n[导出完成]')
-    print(f'  CSV (可用 Excel 直接打开): {csv_path}')
-    print(f'  Markdown 报告:            {md_path}')
+    print(f'  CSV (每行格式: filename, dup path1, dup path2...): {csv_path}')
+    print(f'  Markdown 报告:                                    {md_path}')
     return csv_path, md_path
 
 # ----------------------------- 扫描主流程 -----------------------------
