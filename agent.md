@@ -163,6 +163,7 @@ Menu options:
 - `[1]`: Start / Resume duplicate search (breakpoint continuation).
 - `[2]`: Fresh scan (clears database cache).
 - `[3]`: Export duplicate reports (CSV + Markdown).
+- `[4]`: Toggle error handling mode (Pause for `r` retry vs. Auto-skip errors).
 - `[0]`: Exit.
 
 #### Command-Line Mode
@@ -172,6 +173,9 @@ python duplicate_image_finder_v2.py scan "E:\photos"
 
 # Fresh scan (wipe cache and rescan)
 python duplicate_image_finder_v2.py scan "E:\photos" --fresh
+
+# Automatic error skipping without pausing for retry
+python duplicate_image_finder_v2.py scan "E:\photos" --auto-skip-errors
 
 # Byte-level duplicate scan only (skip visual pHash stage)
 python duplicate_image_finder_v2.py scan "E:\photos" --no-visual

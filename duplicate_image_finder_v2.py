@@ -5,10 +5,12 @@
 =====================================================
 
 特性:
-  * 交互菜单: [1] 开始/继续查找(断点续扫)  [2] 重新扫描  [3] 导出列表(CSV+Markdown)
+  * 交互菜单: [1] 开始/继续查找(断点续扫)  [2] 重新扫描  [3] 导出列表(CSV+Markdown)  [4] 切换错误重试模式
+  * 终端动态显示: 单行显示当前正在读取的文件路径 + 下一行中文进度条，避免刷屏
+  * 容错与重试: 遇到读取失败时可暂停提示输入 'r' 重试，也可一键切换为自动跳过
   * SQLite 缓存: 中断后可续扫; 增量扫描自动跳过 大小+mtime 未变化的文件
   * 分级漏斗加速: 文件名 -> 文件大小 -> 文件头哈希 -> 整文件哈希 -> (可选)感知哈希
-  * 多进程并行计算哈希; 查找过程中实时打印已发现的重复组
+  * 多进程并行计算哈希; BK 树 + 汉明距离快速相似聚类
 
 重复类型:
   * 文件名重复: 基础文件名相同(不区分大小写), 与内容无关
@@ -28,8 +30,10 @@
 """
 
 import argparse
+import ctypes
 import hashlib
 import os
+import shutil
 import sqlite3
 import sys
 import time
@@ -39,18 +43,30 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from PIL import Image
-from tqdm import tqdm
 
 # 禁用大图像素上限限制及 DecompressionBomb 告警
 Image.MAX_IMAGE_PIXELS = None
 warnings.simplefilter('ignore', Image.DecompressionBombWarning)
+
+# Windows 终端 VT 模式与 UTF-8 输出初始化
+if sys.platform == 'win32':
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+    except Exception:
+        pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
 
 # ----------------------------- 常量 -----------------------------
 
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.tif'}
 DB_FILENAME = 'image_dedup.db'
 PREFIX_BYTES = 64 * 1024      # 文件头哈希的采样长度
-CHUNK_SIZE = 2000             # 每个进程任务处理的文件数
+CHUNK_SIZE = 50               # 每个进程任务处理的文件数 (调小以高频平滑更新当前读取文件)
 BATCH = 5000                  # 数据库批量提交大小
 HASH_SIZE = 8                 # pHash 8x8 = 64 位指纹
 DEFAULT_THRESHOLD = 6         # 汉明距离阈值(0=完全一致, 建议 5~8)
@@ -62,7 +78,6 @@ KIND_VISUAL = '视觉相似'
 # ------------------- Windows OneDrive 占位文件检测 -------------------
 
 if sys.platform == 'win32':
-    import ctypes
     from ctypes import wintypes
 
     _k32 = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -80,6 +95,84 @@ if sys.platform == 'win32':
 else:
     def is_placeholder(path: str) -> bool:
         return False
+
+# ----------------------------- 进度条与动态单行显示 -----------------------------
+
+
+class ProgressReporter:
+    """
+    终端双行动态显示控制器:
+    第 1 行: 正在读取: <当前处理的文件路径> (动态原地更新, 避免刷屏)
+    第 2 行: [阶段名称] 进度:  xx.x%|████...| 当前/总数 [已用<剩余, 速率]
+    """
+    def __init__(self, total=0, desc='处理中', is_indeterminate=False):
+        self.total = total
+        self.desc = desc
+        self.count = 0
+        self.start_time = time.time()
+        self.current_file = ''
+        self.last_render_time = 0
+        self.is_indeterminate = is_indeterminate or (total <= 0)
+        self.isatty = sys.stdout.isatty()
+
+    def update(self, n=1, current_file=''):
+        self.count += n
+        if current_file:
+            self.current_file = current_file
+        now = time.time()
+        if now - self.last_render_time > 0.03 or (self.total > 0 and self.count >= self.total):
+            self.render()
+            self.last_render_time = now
+
+    def render(self):
+        if not self.isatty:
+            return
+        try:
+            cols = shutil.get_terminal_size((80, 20)).columns
+        except Exception:
+            cols = 80
+        cols = max(40, cols)
+
+        fn = self.current_file
+        max_len = cols - 12
+        if len(fn) > max_len:
+            fn = '...' + fn[-(max_len - 3):]
+        line1 = f'正在读取: {fn}'.ljust(cols - 1)[:cols - 1]
+
+        elapsed = time.time() - self.start_time
+        rate = (self.count / elapsed) if elapsed > 0 else 0
+        el_str = time.strftime('%M:%S', time.gmtime(elapsed))
+
+        if self.is_indeterminate:
+            line2 = f'{self.desc}: 已发现 {self.count:,} 个文件 [{el_str}, {rate:.1f}文件/秒]'.ljust(cols - 1)[:cols - 1]
+        else:
+            pct = (self.count / self.total) if self.total > 0 else 0
+            if rate > 0 and self.total > self.count:
+                rem = (self.total - self.count) / rate
+                rem_str = time.strftime('%M:%S', time.gmtime(rem))
+            else:
+                rem_str = '00:00'
+            bar_len = max(10, min(25, cols - 55))
+            filled = int(bar_len * pct)
+            bar = '█' * filled + ' ' * (bar_len - filled)
+            line2 = f'{self.desc}: {pct*100:5.1f}%|{bar}| {self.count:,}/{self.total:,} [{el_str}<{rem_str}, {rate:.1f}文件/秒]'.ljust(cols - 1)[:cols - 1]
+
+        sys.stdout.write(f'\r\033[K{line1}\n\033[K{line2}\033[1A\r')
+        sys.stdout.flush()
+
+    def clear(self):
+        if self.isatty:
+            sys.stdout.write('\r\033[K\n\033[K\033[1A\r')
+            sys.stdout.flush()
+
+    def close(self):
+        if self.isatty:
+            self.render()
+            sys.stdout.write('\n\n')
+            sys.stdout.flush()
+        else:
+            elapsed = time.time() - self.start_time
+            print(f'{self.desc} 完成: 共 {self.count:,} 项, 耗时 {elapsed:.1f}s')
 
 # ----------------------------- 数据库 -----------------------------
 
@@ -137,7 +230,7 @@ def walk_images(root: str):
         try:
             entries = sorted(os.scandir(d), key=lambda e: e.name.lower())
         except OSError as e:
-            tqdm.write(f'[警告] 无法进入目录 {d}: {e}')
+            print(f'\n[警告] 无法进入目录 {d}: {e}')
             continue
         for entry in entries:
             try:
@@ -150,7 +243,7 @@ def walk_images(root: str):
                 continue
 
 
-def enumerate_into_db(conn, root: str, db_abs: str):
+def enumerate_into_db(conn, root: str, db_abs: str, auto_skip_errors: bool = False):
     """遍历目录并同步到数据库。返回 (总数, 新增, 变化, 删除, 占位跳过, 出错)"""
     added = changed = deleted = skipped_ph = stat_err = 0
     seen = set()
@@ -189,21 +282,41 @@ def enumerate_into_db(conn, root: str, db_abs: str):
         conn.commit()
         batch.clear()
 
-    for path in walk_images(root):
-        if os.path.abspath(path) == db_abs:
-            continue
-        if is_placeholder(path):
-            skipped_ph += 1
-            continue
-        try:
-            st = os.stat(path)
-        except OSError:
-            stat_err += 1
-            continue
-        batch.append((path, os.path.basename(path), st.st_size, st.st_mtime))
-        if len(batch) >= BATCH:
-            flush()
-    flush()
+    bar = ProgressReporter(0, '[1/5] 遍历目录', is_indeterminate=True)
+    try:
+        for path in walk_images(root):
+            if os.path.abspath(path) == db_abs:
+                continue
+            if is_placeholder(path):
+                skipped_ph += 1
+                continue
+            st = None
+            while True:
+                try:
+                    st = os.stat(path)
+                    break
+                except Exception as e:
+                    if auto_skip_errors:
+                        stat_err += 1
+                        break
+                    bar.clear()
+                    print(f'\n[文件扫描失败] 无法读取文件状态: {path}')
+                    print(f'  错误原因: {type(e).__name__}: {e}')
+                    choice = input("  输入 'r' 重试此文件，按其他键或直接回车跳过: ").strip().lower()
+                    if choice == 'r':
+                        continue
+                    else:
+                        stat_err += 1
+                        break
+            if st is None:
+                continue
+            batch.append((path, os.path.basename(path), st.st_size, st.st_mtime))
+            bar.update(1, current_file=path)
+            if len(batch) >= BATCH:
+                flush()
+        flush()
+    finally:
+        bar.close()
 
     # 删除已不存在的文件记录
     conn.execute('CREATE TEMP TABLE seen_ids(id INTEGER PRIMARY KEY)')
@@ -218,7 +331,7 @@ def enumerate_into_db(conn, root: str, db_abs: str):
     total = db_file_count(conn)
     return total, added, changed, deleted or 0, skipped_ph, stat_err
 
-# ----------------------------- 工作进程 -----------------------------
+# ----------------------------- 工作进程与单文件哈希 -----------------------------
 
 
 def hash_chunk(task):
@@ -237,9 +350,9 @@ def hash_chunk(task):
                         if not block:
                             break
                         h.update(block)
-            out.append((fid, h.hexdigest(), None))
+            out.append((fid, path, h.hexdigest(), None))
         except Exception as e:
-            out.append((fid, None, f'{type(e).__name__}: {e}'[:200]))
+            out.append((fid, path, None, f'{type(e).__name__}: {e}'[:200]))
     return out
 
 
@@ -259,17 +372,47 @@ def phash_chunk(jobs):
                 except Exception:
                     pass
                 hv = imagehash.phash(im, hash_size=HASH_SIZE)
-            out.append((fid, str(hv), None))
+            out.append((fid, path, str(hv), None))
         except Exception as e:
-            out.append((fid, None, f'{type(e).__name__}: {e}'[:200]))
+            out.append((fid, path, None, f'{type(e).__name__}: {e}'[:200]))
     return out
+
+
+def compute_single_hash(mode, path):
+    """主进程重试计算单个文件的哈希"""
+    if mode == 'prefix':
+        h = hashlib.blake2b(digest_size=16)
+        with open(path, 'rb') as f:
+            h.update(f.read(PREFIX_BYTES))
+        return h.hexdigest()
+    elif mode == 'full':
+        h = hashlib.blake2b(digest_size=16)
+        with open(path, 'rb') as f:
+            while True:
+                block = f.read(1 << 20)
+                if not block:
+                    break
+                h.update(block)
+        return h.hexdigest()
+    elif mode == 'phash' or mode is None:
+        import imagehash
+        from PIL import Image
+        Image.MAX_IMAGE_PIXELS = None
+        with Image.open(path) as im:
+            try:
+                im.draft('L', (64, 64))
+            except Exception:
+                pass
+            hv = imagehash.phash(im, hash_size=HASH_SIZE)
+        return str(hv)
+    return None
 
 # ----------------------------- 哈希阶段 -----------------------------
 
 
-def _run_stage(conn, sql, worker_fn, mode, workers, desc):
+def _run_stage(conn, sql, worker_fn, mode, workers, desc, auto_skip_errors=False):
     """通用并行哈希阶段: 按 sql 选出 (id, path), 并行计算, 批量入库。
-    返回 (处理数, 失败数, 结果迭代期间的回调由调用方处理)。"""
+    返回 (处理数, 失败数, 结果列表)。"""
     rows = conn.execute(sql).fetchall()
     if not rows:
         return 0, 0, []
@@ -279,27 +422,59 @@ def _run_stage(conn, sql, worker_fn, mode, workers, desc):
     failures, results = [], []
     col = {'prefix': 'prefix_hash', 'full': 'full_hash', None: 'phash'}[mode]
 
-    with ProcessPoolExecutor(max_workers=workers) as ex, \
-            tqdm(total=len(rows), desc=desc, unit='文件') as bar:
-        for chunk_res in ex.map(worker_fn, tasks):
-            updates, errs = [], []
-            for fid, digest, err in chunk_res:
-                results.append((fid, digest, err))
-                if digest is not None:
-                    updates.append((digest, fid))
-                else:
-                    errs.append((err, fid))
-                    failures.append((fid, err))
-            if updates:
-                conn.executemany(f'UPDATE files SET {col}=? WHERE id=?', updates)
-            if errs:
-                conn.executemany('UPDATE files SET error=? WHERE id=?', errs)
-            conn.commit()
-            bar.update(len(chunk_res))
+    bar = ProgressReporter(len(rows), desc)
+    try:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            for chunk_res in ex.map(worker_fn, tasks):
+                updates, errs = [], []
+                last_path = ''
+                for fid, path, digest, err in chunk_res:
+                    last_path = path
+                    if digest is not None:
+                        updates.append((digest, fid))
+                        results.append((fid, digest, None))
+                    else:
+                        if not auto_skip_errors:
+                            bar.clear()
+                            print(f'\n[文件处理失败] 路径: {path}')
+                            print(f'  错误原因: {err}')
+                            retried = False
+                            while True:
+                                choice = input("  输入 'r' 重试此文件，按其他键或直接回车跳过: ").strip().lower()
+                                if choice == 'r':
+                                    try:
+                                        digest = compute_single_hash(mode, path)
+                                        updates.append((digest, fid))
+                                        results.append((fid, digest, None))
+                                        print('  --> [重试成功！]\n')
+                                        retried = True
+                                        break
+                                    except Exception as retry_e:
+                                        print(f'  --> [重试仍失败]: {type(retry_e).__name__}: {retry_e}')
+                                else:
+                                    break
+                            if not retried:
+                                errs.append((err, fid))
+                                failures.append((fid, err))
+                                results.append((fid, None, err))
+                        else:
+                            errs.append((err, fid))
+                            failures.append((fid, err))
+                            results.append((fid, None, err))
+
+                if updates:
+                    conn.executemany(f'UPDATE files SET {col}=? WHERE id=?', updates)
+                if errs:
+                    conn.executemany('UPDATE files SET error=? WHERE id=?', errs)
+                conn.commit()
+                bar.update(len(chunk_res), current_file=last_path)
+    finally:
+        bar.close()
+
     return len(rows), len(failures), results
 
 
-def stage_prefix_hash(conn, workers):
+def stage_prefix_hash(conn, workers, auto_skip_errors=False):
     conn.execute('DROP TABLE IF EXISTS dup_sizes')
     conn.execute('CREATE TEMP TABLE dup_sizes AS '
                  'SELECT size FROM files GROUP BY size HAVING COUNT(*)>1')
@@ -307,21 +482,15 @@ def stage_prefix_hash(conn, workers):
         conn,
         'SELECT f.id, f.path FROM files f JOIN dup_sizes d ON f.size=d.size '
         'WHERE f.prefix_hash IS NULL AND f.error IS NULL',
-        hash_chunk, 'prefix', workers, '文件头哈希(仅大小重复的文件)')
+        hash_chunk, 'prefix', workers, '[3/5] 计算文件头哈希', auto_skip_errors=auto_skip_errors)
     return n, fails
 
 
-def stage_full_hash(conn, workers, live_print=True):
+def stage_full_hash(conn, workers, auto_skip_errors=False):
     conn.execute('DROP TABLE IF EXISTS dup_prefix')
     conn.execute('CREATE TEMP TABLE dup_prefix AS '
                  'SELECT size, prefix_hash FROM files WHERE prefix_hash IS NOT NULL '
                  'GROUP BY size, prefix_hash HAVING COUNT(*)>1')
-
-    # 已有整文件哈希的组(用于实时发现新成员)
-    known = defaultdict(list)
-    for h, path in conn.execute(
-            'SELECT full_hash, path FROM files WHERE full_hash IS NOT NULL ORDER BY id'):
-        known[h].append(path)
 
     rows = conn.execute(
         'SELECT f.id, f.path FROM files f JOIN dup_prefix d '
@@ -330,39 +499,13 @@ def stage_full_hash(conn, workers, live_print=True):
     if not rows:
         return 0, 0
 
-    chunks = [rows[i:i + CHUNK_SIZE] for i in range(0, len(rows), CHUNK_SIZE)]
-    failures = 0
-    with ProcessPoolExecutor(max_workers=workers) as ex, \
-            tqdm(total=len(rows), desc='整文件哈希(仅头部冲突的文件)', unit='文件') as bar:
-        for chunk_res in ex.map(hash_chunk, [('full', c) for c in chunks]):
-            updates, errs = [], []
-            for fid, digest, err in chunk_res:
-                if digest is not None:
-                    updates.append((digest, fid))
-                else:
-                    errs.append((err, fid))
-                    failures += 1
-            if updates:
-                conn.executemany('UPDATE files SET full_hash=? WHERE id=?', updates)
-            if errs:
-                conn.executemany('UPDATE files SET error=? WHERE id=?', errs)
-            conn.commit()
-
-            if live_print:
-                qm = ','.join('?' * len(updates))
-                if updates:
-                    for h, path in conn.execute(
-                            f'SELECT full_hash, path FROM files WHERE id IN ({qm}) ORDER BY id',
-                            [u[1] for u in updates]):
-                        lst = known[h]
-                        lst.append(path)
-                        if len(lst) == 2:
-                            show_group(KIND_EXACT, os.path.basename(lst[0]), lst)
-                        elif len(lst) > 2:
-                            tqdm.write(f'+ 同组新增: {path}  (组: {os.path.basename(lst[0])})\n')
-            bar.update(len(chunk_res))
-    conn.commit()
-    return len(rows), failures
+    n, fails, _ = _run_stage(
+        conn,
+        'SELECT f.id, f.path FROM files f JOIN dup_prefix d '
+        'ON f.size=d.size AND f.prefix_hash=d.prefix_hash '
+        'WHERE f.full_hash IS NULL AND f.error IS NULL',
+        hash_chunk, 'full', workers, '[4/5] 计算整文件哈希', auto_skip_errors=auto_skip_errors)
+    return n, fails
 
 # ----------------------------- BK 树聚类 -----------------------------
 
@@ -435,10 +578,8 @@ class UnionFind:
             self.rank[ra] += 1
 
 
-def stage_visual(conn, workers, threshold, skip_if_clean):
-    """视觉相似检测: 对代表文件算 pHash, BK树聚类, 展开成组。
-    返回 (新算哈希数, 组数)。"""
-    # 代表 = 每个整文件哈希组取第一个 + 所有无整文件哈希的文件(大小唯一/头部唯一)
+def stage_visual(conn, workers, threshold, skip_if_clean, auto_skip_errors=False):
+    """视觉相似检测: 对代表文件算 pHash, BK树聚类, 展开成组。返回 (新算哈希数, 组数)。"""
     conn.execute('DROP TABLE IF EXISTS reps')
     conn.execute(
         'CREATE TEMP TABLE reps AS '
@@ -449,9 +590,9 @@ def stage_visual(conn, workers, threshold, skip_if_clean):
     n_new, fails, _ = _run_stage(
         conn,
         'SELECT r.id, f.path FROM reps r JOIN files f ON f.id=r.id WHERE f.phash IS NULL',
-        phash_chunk, None, workers, '感知哈希 pHash(视觉相似)')
+        phash_chunk, None, workers, '[5/5] 计算感知哈希 pHash', auto_skip_errors=auto_skip_errors)
     if fails:
-        tqdm.write(f'[提示] {fails} 张图片无法解码, 已跳过视觉相似检测')
+        print(f'[提示] {fails} 张图片无法解码, 已记录错误并跳过')
 
     rep_rows = conn.execute(
         'SELECT r.id, f.phash, f.full_hash FROM reps r JOIN files f ON f.id=r.id '
@@ -459,7 +600,7 @@ def stage_visual(conn, workers, threshold, skip_if_clean):
 
     visual_done_before = get_meta(conn, 'visual_done') == '1'
     if skip_if_clean and n_new == 0 and visual_done_before:
-        tqdm.write('缓存无变化, 沿用上次视觉相似分组 (如需强制重算请选 2 重新扫描)')
+        print('缓存无变化, 沿用上次视觉相似分组 (如需强制重算请选 2 重新扫描)')
         return 0, conn.execute(
             'SELECT COUNT(DISTINCT visual_group) FROM files WHERE visual_group IS NOT NULL').fetchone()[0]
 
@@ -471,12 +612,15 @@ def stage_visual(conn, workers, threshold, skip_if_clean):
     uf = UnionFind(n)
     tree = BKTree()
     hits_buf = []
-    for i in tqdm(range(n), desc='BK树聚类(汉明距离)', unit='哈希'):
+    bar = ProgressReporter(n, '[5/5] BK树聚类')
+    for i in range(n):
         hits_buf.clear()
         tree.query(hashes[i], threshold, hits_buf)
         for j in hits_buf:
             uf.union(i, j)
         tree.insert(hashes[i], i)
+        bar.update(1, current_file=f'正在聚类第 {i+1}/{n} 个哈希')
+    bar.close()
 
     # 聚类结果 -> 代表索引
     clusters = defaultdict(list)
@@ -508,11 +652,10 @@ def stage_visual(conn, workers, threshold, skip_if_clean):
     groups = []
     for root, idxs in clusters.items():
         if len(idxs) < 2:
-            continue  # 单一内容的组(纯字节重复)已在"内容重复"中报告
+            continue
         ms = sorted(members[root], key=lambda x: x[0])
         gid += 1
         groups.append((gid, ms))
-        show_group(KIND_VISUAL, os.path.basename(ms[0][1]), [p for _, p in ms])
 
     if groups:
         for gid, ms in groups:
@@ -532,7 +675,7 @@ def show_group(kind, name, paths):
     lines = [f'[{kind}] {name} ({len(paths)} 份):']
     for i, p in enumerate(paths, 1):
         lines.append(f'  dup path{i}: {p}')
-    tqdm.write('\n'.join(lines) + '\n')
+    print('\n'.join(lines) + '\n')
 
 
 def iter_name_groups(conn):
@@ -603,7 +746,6 @@ def iter_visual_groups(conn):
     if len(group) > 1:
         yield group
 
-
 # ----------------------------- 导出报告 -----------------------------
 
 
@@ -636,14 +778,14 @@ def export_report(conn, out_dir, echo=True):
         f.write('# 重复图片报告\n\n')
         f.write(f'- 扫描目录: `{root}`\n')
         f.write(f'- 生成时间: {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
-        f.write(f'- 索引文件总数: {total_files}\n')
+        f.write(f'- 索引文件总数: {total_files:,}\n')
         for kind, groups in sections:
             n_files = sum(len(g) for g in groups)
-            f.write(f'- {kind}: {len(groups)} 组, 涉及 {n_files} 个文件\n')
+            f.write(f'- {kind}: {len(groups):,} 组, 涉及 {n_files:,} 个文件\n')
         for kind, groups in sections:
             if not groups:
                 continue
-            f.write(f'\n## {kind} ({len(groups)} 组)\n')
+            f.write(f'\n## {kind} ({len(groups):,} 组)\n')
             for gi, group in enumerate(groups, 1):
                 label = group[0][1]
                 f.write(f'\n### 组 {gi}: `{label}` ({len(group)} 份)\n\n')
@@ -656,11 +798,11 @@ def export_report(conn, out_dir, echo=True):
         print('重复文件清单摘要 (完整清单见导出的 CSV / Markdown 报告)')
         print('=' * 60)
         for kind, groups in sections:
-            print(f'\n===== {kind}: 共 {len(groups)} 组 =====')
+            print(f'\n===== {kind}: 共 {len(groups):,} 组 =====')
             for group in groups[:5]:
                 show_group(kind, group[0][1], [r[2] for r in group])
             if len(groups) > 5:
-                print(f'  ... 其余 {len(groups) - 5} 组已写入报告文件 ...\n')
+                print(f'  ... 其余 {len(groups) - 5:,} 组已写入报告文件 ...\n')
 
     print(f'\n[导出完成]')
     print(f'  CSV (每行格式: filename, dup path1, dup path2...): {csv_path}')
@@ -670,7 +812,7 @@ def export_report(conn, out_dir, echo=True):
 # ----------------------------- 扫描主流程 -----------------------------
 
 
-def run_scan(root, db_path, fresh, visual, threshold, workers, interactive):
+def run_scan(root, db_path, fresh, visual, threshold, workers, interactive, auto_skip_errors=False):
     root = os.path.abspath(root)
     if not os.path.isdir(root):
         print(f'错误: 目录不存在 - {root}')
@@ -697,35 +839,35 @@ def run_scan(root, db_path, fresh, visual, threshold, workers, interactive):
     conn.commit()
 
     t0 = time.time()
-    print(f'\n[1/5] 遍历目录: {root}')
-    total, added, changed, deleted, ph_skip, stat_err = enumerate_into_db(conn, root, db_abs)
+    print(f'\n===== 开始扫描: {root} =====')
+    total, added, changed, deleted, ph_skip, stat_err = enumerate_into_db(
+        conn, root, db_abs, auto_skip_errors=auto_skip_errors)
     changed_total = added + changed + deleted
-    print(f'  共 {total} 个图片文件 | 新增 {added} | 变化 {changed} | 已删除 {deleted} '
-          f'| OneDrive占位跳过 {ph_skip} | 读取失败 {stat_err}')
+    print(f'  索引统计: 共 {total:,} 个图片文件 | 新增 {added:,} | 变化 {changed:,} | 已删除 {deleted:,} '
+          f'| OneDrive占位跳过 {ph_skip:,} | 读取失败 {stat_err:,}')
     if total < 2:
         print('文件不足, 无需比较。')
         return 0
 
     print('\n[2/5] 检查文件名重复')
     name_groups = list(iter_name_groups(conn))
-    for g in name_groups:
-        show_group(KIND_NAME, g[0][1], [r[2] for r in g])
-    print(f'  文件名重复: {len(name_groups)} 组')
+    print(f'  文件名重复: {len(name_groups):,} 组')
 
     print('\n[3/5] 计算文件头哈希 (仅大小重复的文件)')
-    n, fails = stage_prefix_hash(conn, workers)
-    print(f'  处理 {n} 个文件, 失败 {fails}')
+    n, fails = stage_prefix_hash(conn, workers, auto_skip_errors=auto_skip_errors)
+    print(f'  处理完成: {n:,} 个文件, 失败 {fails:,}')
 
-    print('\n[4/5] 计算整文件哈希 (仅头部冲突的文件) -> 确认内容重复')
-    n, fails = stage_full_hash(conn, workers)
+    print('\n[4/5] 计算整文件哈希 (仅头部冲突的文件)')
+    n, fails = stage_full_hash(conn, workers, auto_skip_errors=auto_skip_errors)
     exact_groups = list(iter_exact_groups(conn))
-    print(f'  处理 {n} 个文件, 失败 {fails} | 内容重复: {len(exact_groups)} 组')
+    print(f'  处理完成: {n:,} 个文件, 失败 {fails:,} | 内容重复: {len(exact_groups):,} 组')
 
     if visual:
         print(f'\n[5/5] 视觉相似检测 (pHash, 阈值 {threshold})')
         n_new, v_groups = stage_visual(conn, workers, threshold,
-                                       skip_if_clean=(changed_total == 0))
-        print(f'  视觉相似: {v_groups} 组')
+                                       skip_if_clean=(changed_total == 0),
+                                       auto_skip_errors=auto_skip_errors)
+        print(f'  处理完成: 新算 {n_new:,} 张图片 | 视觉相似: {v_groups:,} 组')
     else:
         print('\n[5/5] 视觉相似检测: 已跳过 (--no-visual)')
 
@@ -734,18 +876,18 @@ def run_scan(root, db_path, fresh, visual, threshold, workers, interactive):
     redundant_bytes = sum(g[0][3] * (len(g) - 1) for g in exact_groups)
     print('\n' + '=' * 60)
     print(f'扫描完成, 耗时 {time.time() - t0:.1f} 秒')
-    print(f'  索引文件:     {total}')
-    print(f'  文件名重复:   {len(name_groups)} 组')
-    print(f'  内容重复:     {len(exact_groups)} 组 (冗余 {redundant_files} 个文件, '
+    print(f'  索引文件总数:  {total:,}')
+    print(f'  文件名重复组:  {len(name_groups):,} 组')
+    print(f'  内容重复组:    {len(exact_groups):,} 组 (冗余 {redundant_files:,} 个文件, '
           f'可释放约 {redundant_bytes / 1048576:.1f} MB)')
     if visual:
         vg = conn.execute('SELECT COUNT(DISTINCT visual_group) FROM files '
                           'WHERE visual_group IS NOT NULL').fetchone()[0]
-        print(f'  视觉相似:     {vg} 组')
+        print(f'  视觉相似组:    {vg:,} 组')
     print('=' * 60)
 
     if interactive and input('\n是否现在导出报告 (CSV + Markdown)? [Y/n]: ').strip().lower() != 'n':
-        export_report(conn, os.path.dirname(db_abs) or '.', echo=False)
+        export_report(conn, os.path.dirname(db_abs) or '.', echo=True)
 
     conn.close()
     return 0
@@ -759,25 +901,36 @@ def prompt(text, default):
 
 
 def menu(db_path):
+    auto_skip_errors = False
     while True:
         conn = open_db(os.path.abspath(db_path))
         last_root = get_meta(conn, 'root')
         n_files = db_file_count(conn)
         conn.close()
-        print('\n' + '=' * 46)
+        print('\n' + '=' * 50)
         print('        重复图片查找工具 (海量文件版)')
-        print('=' * 46)
-        print(f'缓存数据库: {db_path} (已索引 {n_files} 个文件)')
+        print('=' * 50)
+        print(f'缓存数据库: {db_path} (已索引 {n_files:,} 个文件)')
         print(f'上次扫描目录: {last_root or "未设置"}')
-        print('-' * 46)
+        mode_label = '自动跳过错误(不暂停)' if auto_skip_errors else '遇错暂停(提示输入 r 重试)'
+        print(f'错误处理模式: {mode_label}')
+        print('-' * 50)
         print(' [1] 开始/继续查找重复项 (断点续扫)')
         print(' [2] 重新扫描 (清空缓存)')
         print(' [3] 导出重复文件列表 (CSV + Markdown)')
+        print(f' [4] 切换错误处理模式 (当前: {"自动跳过" if auto_skip_errors else "暂停重试"})')
         print(' [0] 退出')
         choice = input('请选择: ').strip()
 
         if choice == '0':
             break
+        elif choice == '4':
+            auto_skip_errors = not auto_skip_errors
+            if auto_skip_errors:
+                print('\n[已设置] 遇到读取错误时将【自动跳过并记录】，不暂停重试。')
+            else:
+                print('\n[已设置] 遇到读取错误时将【暂停并提示输入 r 重试】。')
+            continue
         elif choice in ('1', '2'):
             fresh = choice == '2'
             if fresh and n_files > 0:
@@ -796,7 +949,7 @@ def menu(db_path):
                 threshold = DEFAULT_THRESHOLD
             threshold = max(0, min(64, threshold))
             try:
-                run_scan(root, db_path, fresh, visual, threshold, workers, interactive=True)
+                run_scan(root, db_path, fresh, visual, threshold, workers, interactive=True, auto_skip_errors=auto_skip_errors)
             except KeyboardInterrupt:
                 print('\n已中断。下次选择 [1] 可从断点继续, 已完成的结果保存在数据库中。')
         elif choice == '3':
@@ -816,13 +969,6 @@ def menu(db_path):
 
 
 def main():
-    if sys.platform == 'win32':
-        for stream in (sys.stdout, sys.stderr):
-            if not stream.isatty():
-                try:
-                    stream.reconfigure(encoding='utf-8', errors='replace')
-                except Exception:
-                    pass
     parser = argparse.ArgumentParser(
         description='重复图片查找工具 (海量文件版)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -837,6 +983,7 @@ def main():
     p_scan.add_argument('--no-visual', action='store_true', help='跳过视觉相似检测')
     p_scan.add_argument('--threshold', type=int, default=DEFAULT_THRESHOLD, help='汉明距离阈值')
     p_scan.add_argument('--workers', type=int, default=4)
+    p_scan.add_argument('--auto-skip-errors', action='store_true', help='遇到错误自动跳过，不暂停要求输入r重试')
 
     sub.add_parser('export', help='导出重复列表 (CSV + Markdown)')
 
@@ -845,7 +992,8 @@ def main():
     if args.cmd == 'scan':
         try:
             sys.exit(run_scan(args.root, args.db, args.fresh, not args.no_visual,
-                              args.threshold, args.workers, interactive=False))
+                              args.threshold, args.workers, interactive=False,
+                              auto_skip_errors=args.auto_skip_errors))
         except KeyboardInterrupt:
             print('\n已中断。下次运行可断点续扫。')
             sys.exit(130)
