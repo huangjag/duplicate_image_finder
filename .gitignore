@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# SQLite runtime cache databases
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Generated report artifacts
+duplicates_report.csv
+duplicates_report.md
+duplicates.txt
+report.txt
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+wheels/
+
+# IDE & Editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+Thumbs.db
+[Dd]esktop.ini
+.DS_Store
