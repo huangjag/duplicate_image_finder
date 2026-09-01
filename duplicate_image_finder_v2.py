@@ -506,8 +506,8 @@ def _run_stage(conn, sql, worker_fn, mode, workers, desc, auto_skip_errors=False
 
 def stage_prefix_hash(conn, workers, auto_skip_errors=False):
     conn.execute('DROP TABLE IF EXISTS dup_sizes')
-    conn.execute('CREATE TEMP TABLE dup_sizes AS '
-                 'SELECT size FROM files GROUP BY size HAVING COUNT(*)>1')
+    conn.execute('CREATE TEMP TABLE dup_sizes(size INTEGER PRIMARY KEY)')
+    conn.execute('INSERT INTO dup_sizes SELECT size FROM files GROUP BY size HAVING COUNT(*)>1')
     n, fails, _ = _run_stage(
         conn,
         'SELECT f.id, f.path FROM files f JOIN dup_sizes d ON f.size=d.size '
@@ -518,8 +518,8 @@ def stage_prefix_hash(conn, workers, auto_skip_errors=False):
 
 def stage_full_hash(conn, workers, auto_skip_errors=False):
     conn.execute('DROP TABLE IF EXISTS dup_prefix')
-    conn.execute('CREATE TEMP TABLE dup_prefix AS '
-                 'SELECT size, prefix_hash FROM files WHERE prefix_hash IS NOT NULL '
+    conn.execute('CREATE TEMP TABLE dup_prefix(size INTEGER, prefix_hash TEXT, PRIMARY KEY(size, prefix_hash))')
+    conn.execute('INSERT INTO dup_prefix SELECT size, prefix_hash FROM files WHERE prefix_hash IS NOT NULL '
                  'GROUP BY size, prefix_hash HAVING COUNT(*)>1')
 
     rows = conn.execute(
@@ -527,7 +527,7 @@ def stage_full_hash(conn, workers, auto_skip_errors=False):
         'ON f.size=d.size AND f.prefix_hash=d.prefix_hash '
         'WHERE f.full_hash IS NULL AND f.error IS NULL').fetchall()
     if not rows:
-        print('[4/5] 计算整文件哈希: 0 个文件需计算 (已全部完成)')
+        print('  已全部完成 (无需额外计算)')
         return 0, 0
 
     n, fails, _ = _run_stage(
@@ -614,8 +614,9 @@ def cluster_hashes_parallel(hashes_list, threshold, workers, progress_desc='[5/5
 def stage_visual(conn, workers, threshold, skip_if_clean, auto_skip_errors=False):
     """视觉相似检测: 对代表文件算 pHash, 向量化并行聚类, 展开成组。返回 (新算哈希数, 组数)。"""
     conn.execute('DROP TABLE IF EXISTS reps')
+    conn.execute('CREATE TEMP TABLE reps(id INTEGER PRIMARY KEY)')
     conn.execute(
-        'CREATE TEMP TABLE reps AS '
+        'INSERT INTO reps '
         'SELECT MIN(id) AS id FROM files WHERE full_hash IS NOT NULL GROUP BY full_hash '
         'UNION '
         'SELECT id FROM files WHERE full_hash IS NULL AND error IS NULL')
