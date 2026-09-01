@@ -6,16 +6,16 @@
 
 特性:
   * 交互菜单: [1] 开始/继续查找(断点续扫)  [2] 重新扫描  [3] 导出列表(CSV+Markdown)  [4] 切换错误重试模式
-  * 终端动态显示: 单行显示当前正在读取的文件路径 + 下一行中文进度条，避免刷屏
+  * 终端单行动态更新: 原地更新单行进度与当前文件，绝不换行滚动刷屏，保留全部历史日志
+  * 智能断点续扫: 支持跳过磁盘重遍历，直达未完成阶段 (文件头/整文件/SIMD感知哈希聚类)
   * 容错与重试: 遇到读取失败时可暂停提示输入 'r' 重试，也可一键切换为自动跳过
-  * SQLite 缓存: 中断后可续扫; 增量扫描自动跳过 大小+mtime 未变化的文件
   * 分级漏斗加速: 文件名 -> 文件大小 -> 文件头哈希 -> 整文件哈希 -> (可选)感知哈希
-  * 多进程并行计算哈希; BK 树 + 汉明距离快速相似聚类
+  * NumPy SIMD 硬件级向量化 (POPCNT) 多线程块并行快速相似聚类
 
 重复类型:
   * 文件名重复: 基础文件名相同(不区分大小写), 与内容无关
   * 内容重复:   字节级完全一致(整文件 BLAKE2b-128 哈希)
-  * 视觉相似(可选): pHash 64位指纹 + BK树 + 汉明距离聚类,
+  * 视觉相似(可选): pHash 64位指纹 + SIMD 向量化并行聚类,
     可识别重新压缩/改分辨率/加水印/改格式后肉眼相同的图片
 
 依赖:
@@ -24,6 +24,7 @@
 用法:
   python duplicate_image_finder_v2.py                          # 交互菜单
   python duplicate_image_finder_v2.py scan <目录>              # 续扫
+  python duplicate_image_finder_v2.py scan <目录> --skip-walk  # 跳过磁盘遍历直达未完成阶段
   python duplicate_image_finder_v2.py scan <目录> --fresh      # 重新扫描
   python duplicate_image_finder_v2.py scan <目录> --no-visual  # 只查字节级重复
   python duplicate_image_finder_v2.py export                   # 导出报告
@@ -37,6 +38,7 @@ import shutil
 import sqlite3
 import sys
 import time
+import unicodedata
 import warnings
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -97,33 +99,50 @@ else:
     def is_placeholder(path: str) -> bool:
         return False
 
-# ----------------------------- 进度条与动态单行显示 -----------------------------
+# ----------------------------- 终端单行动态显示 -----------------------------
 
 
-class ProgressReporter:
+def visual_len(s: str) -> int:
+    """计算中英文字符串在终端中所占的实际显示列数 (全角占 2 列, 半角占 1 列)"""
+    return sum(2 if unicodedata.east_asian_width(c) in ('F', 'W') else 1 for c in s)
+
+
+def truncate_to_width(s: str, max_w: int) -> str:
+    """严格按终端显示列数截断字符串, 避免超出终端宽度导致换行"""
+    cur_w = 0
+    res = []
+    for ch in s:
+        cw = 2 if unicodedata.east_asian_width(ch) in ('F', 'W') else 1
+        if cur_w + cw > max_w:
+            break
+        cur_w += cw
+        res.append(ch)
+    return ''.join(res)
+
+
+class SingleLineReporter:
     """
-    终端双行动态显示控制器:
-    第 1 行: 正在读取: <当前处理的文件路径> (动态原地更新, 避免刷屏)
-    第 2 行: [阶段名称] 进度:  xx.x%|████...| 当前/总数 [已用<剩余, 速率]
+    单行就地动态进度控制器:
+    格式: [阶段] 百分比 | 当前: <文件名/路径> | 当前/总数 [已用<剩余, 速率]
+    特性: 严格限制在终端单行内, 使用 \\r 覆盖, 绝不换行滚动, 绝不冲刷历史日志
     """
-    def __init__(self, total=0, desc='处理中', is_indeterminate=False):
+    def __init__(self, total: int = 0, desc: str = '处理中'):
         self.total = total
         self.desc = desc
         self.count = 0
         self.start_time = time.time()
         self.current_file = ''
-        self.last_render_time = 0
-        self.is_indeterminate = is_indeterminate or (total <= 0)
+        self.last_render = 0
         self.isatty = sys.stdout.isatty()
 
-    def update(self, n=1, current_file=''):
+    def update(self, n: int = 1, current_file: str = ''):
         self.count += n
         if current_file:
             self.current_file = current_file
         now = time.time()
-        if now - self.last_render_time > 0.03 or (self.total > 0 and self.count >= self.total):
+        if now - self.last_render > 0.04 or (self.total > 0 and self.count >= self.total):
             self.render()
-            self.last_render_time = now
+            self.last_render = now
 
     def render(self):
         if not self.isatty:
@@ -134,42 +153,51 @@ class ProgressReporter:
             cols = 80
         cols = max(40, cols)
 
-        fn = self.current_file
-        max_len = cols - 12
-        if len(fn) > max_len:
-            fn = '...' + fn[-(max_len - 3):]
-        line1 = f'正在读取: {fn}'.ljust(cols - 1)[:cols - 1]
-
         elapsed = time.time() - self.start_time
         rate = (self.count / elapsed) if elapsed > 0 else 0
         el_str = time.strftime('%M:%S', time.gmtime(elapsed))
 
-        if self.is_indeterminate:
-            line2 = f'{self.desc}: 已发现 {self.count:,} 个文件 [{el_str}, {rate:.1f}文件/秒]'.ljust(cols - 1)[:cols - 1]
-        else:
-            pct = (self.count / self.total) if self.total > 0 else 0
+        if self.total > 0:
+            pct_str = f'{self.count * 100 / self.total:5.1f}%'
             if rate > 0 and self.total > self.count:
-                rem = (self.total - self.count) / rate
-                rem_str = time.strftime('%M:%S', time.gmtime(rem))
+                rem_str = time.strftime('%M:%S', time.gmtime((self.total - self.count) / rate))
             else:
                 rem_str = '00:00'
-            bar_len = max(10, min(25, cols - 55))
-            filled = int(bar_len * pct)
-            bar = '█' * filled + ' ' * (bar_len - filled)
-            line2 = f'{self.desc}: {pct*100:5.1f}%|{bar}| {self.count:,}/{self.total:,} [{el_str}<{rem_str}, {rate:.1f}文件/秒]'.ljust(cols - 1)[:cols - 1]
+            stats_str = f'| {self.count:,}/{self.total:,} [{el_str}<{rem_str}, {rate:.1f}个/s]'
+        else:
+            pct_str = ''
+            stats_str = f'| {self.count:,}个 [{el_str}, {rate:.1f}个/s]'
 
-        sys.stdout.write(f'\r\033[K{line1}\n\033[K{line2}\033[1A\r')
+        prefix = f'{self.desc} {pct_str} '
+        fixed_w = visual_len(prefix) + visual_len(stats_str) + 6
+        avail_w = max(10, cols - fixed_w)
+
+        fn = self.current_file
+        if visual_len(fn) > avail_w:
+            fn = '...' + fn[-(avail_w - 3):]
+            while visual_len(fn) > avail_w and len(fn) > 4:
+                fn = '...' + fn[4:]
+
+        full_line = f'{prefix}| 当前: {fn} {stats_str}'
+        full_line = truncate_to_width(full_line, cols - 1)
+        pad = ' ' * max(0, cols - 1 - visual_len(full_line))
+
+        sys.stdout.write(f'\r{full_line}{pad}')
         sys.stdout.flush()
 
     def clear(self):
         if self.isatty:
-            sys.stdout.write('\r\033[K\n\033[K\033[1A\r')
+            try:
+                cols = shutil.get_terminal_size((80, 20)).columns
+            except Exception:
+                cols = 80
+            sys.stdout.write('\r' + ' ' * (cols - 1) + '\r')
             sys.stdout.flush()
 
     def close(self):
         if self.isatty:
             self.render()
-            sys.stdout.write('\n\n')
+            sys.stdout.write('\n')
             sys.stdout.flush()
         else:
             elapsed = time.time() - self.start_time
@@ -283,7 +311,7 @@ def enumerate_into_db(conn, root: str, db_abs: str, auto_skip_errors: bool = Fal
         conn.commit()
         batch.clear()
 
-    bar = ProgressReporter(0, '[1/5] 遍历目录', is_indeterminate=True)
+    bar = SingleLineReporter(0, '[1/5] 遍历目录')
     try:
         for path in walk_images(root):
             if os.path.abspath(path) == db_abs:
@@ -416,6 +444,7 @@ def _run_stage(conn, sql, worker_fn, mode, workers, desc, auto_skip_errors=False
     返回 (处理数, 失败数, 结果列表)。"""
     rows = conn.execute(sql).fetchall()
     if not rows:
+        print(f'{desc}: 0 个文件需计算 (已全部完成)')
         return 0, 0, []
 
     chunks = [rows[i:i + CHUNK_SIZE] for i in range(0, len(rows), CHUNK_SIZE)]
@@ -423,7 +452,7 @@ def _run_stage(conn, sql, worker_fn, mode, workers, desc, auto_skip_errors=False
     failures, results = [], []
     col = {'prefix': 'prefix_hash', 'full': 'full_hash', None: 'phash'}[mode]
 
-    bar = ProgressReporter(len(rows), desc)
+    bar = SingleLineReporter(len(rows), desc)
     try:
         with ProcessPoolExecutor(max_workers=workers) as ex:
             for chunk_res in ex.map(worker_fn, tasks):
@@ -498,6 +527,7 @@ def stage_full_hash(conn, workers, auto_skip_errors=False):
         'ON f.size=d.size AND f.prefix_hash=d.prefix_hash '
         'WHERE f.full_hash IS NULL AND f.error IS NULL').fetchall()
     if not rows:
+        print('[4/5] 计算整文件哈希: 0 个文件需计算 (已全部完成)')
         return 0, 0
 
     n, fails, _ = _run_stage(
@@ -567,7 +597,7 @@ def cluster_hashes_parallel(hashes_list, threshold, workers, progress_desc='[5/5
     block_pairs = [(bi, bj) for bi in range(num_blocks) for bj in range(bi, num_blocks)]
     total_pairs = len(block_pairs)
 
-    bar = ProgressReporter(total_pairs, desc=progress_desc)
+    bar = SingleLineReporter(total_pairs, desc=progress_desc)
     try:
         with ThreadPoolExecutor(max_workers=workers) as ex:
             for idx, res in enumerate(ex.map(compare_block_pair, block_pairs), 1):
@@ -806,7 +836,7 @@ def export_report(conn, out_dir, echo=True):
 # ----------------------------- 扫描主流程 -----------------------------
 
 
-def run_scan(root, db_path, fresh, visual, threshold, workers, interactive, auto_skip_errors=False):
+def run_scan(root, db_path, fresh, visual, threshold, workers, interactive, auto_skip_errors=False, skip_walk=False):
     root = os.path.abspath(root)
     if not os.path.isdir(root):
         print(f'错误: 目录不存在 - {root}')
@@ -834,11 +864,16 @@ def run_scan(root, db_path, fresh, visual, threshold, workers, interactive, auto
 
     t0 = time.time()
     print(f'\n===== 开始扫描: {root} =====')
-    total, added, changed, deleted, ph_skip, stat_err = enumerate_into_db(
-        conn, root, db_abs, auto_skip_errors=auto_skip_errors)
-    changed_total = added + changed + deleted
-    print(f'  索引统计: 共 {total:,} 个图片文件 | 新增 {added:,} | 变化 {changed:,} | 已删除 {deleted:,} '
-          f'| OneDrive占位跳过 {ph_skip:,} | 读取失败 {stat_err:,}')
+    if skip_walk and db_file_count(conn) > 0:
+        total = db_file_count(conn)
+        changed_total = 0
+        print(f'[1/5] 遍历目录: 已跳过 (直接使用数据库已有的 {total:,} 个文件索引)')
+    else:
+        total, added, changed, deleted, ph_skip, stat_err = enumerate_into_db(
+            conn, root, db_abs, auto_skip_errors=auto_skip_errors)
+        changed_total = added + changed + deleted
+        print(f'  索引统计: 共 {total:,} 个图片文件 | 新增 {added:,} | 变化 {changed:,} | 已删除 {deleted:,} '
+              f'| OneDrive占位跳过 {ph_skip:,} | 读取失败 {stat_err:,}')
     if total < 2:
         print('文件不足, 无需比较。')
         return 0
@@ -849,12 +884,16 @@ def run_scan(root, db_path, fresh, visual, threshold, workers, interactive, auto
 
     print('\n[3/5] 计算文件头哈希 (仅大小重复的文件)')
     n, fails = stage_prefix_hash(conn, workers, auto_skip_errors=auto_skip_errors)
-    print(f'  处理完成: {n:,} 个文件, 失败 {fails:,}')
+    if n > 0:
+        print(f'  处理完成: {n:,} 个文件, 失败 {fails:,}')
 
     print('\n[4/5] 计算整文件哈希 (仅头部冲突的文件)')
     n, fails = stage_full_hash(conn, workers, auto_skip_errors=auto_skip_errors)
     exact_groups = list(iter_exact_groups(conn))
-    print(f'  处理完成: {n:,} 个文件, 失败 {fails:,} | 内容重复: {len(exact_groups):,} 组')
+    if n > 0:
+        print(f'  处理完成: {n:,} 个文件, 失败 {fails:,} | 内容重复: {len(exact_groups):,} 组')
+    else:
+        print(f'  内容重复: {len(exact_groups):,} 组')
 
     if visual:
         print(f'\n[5/5] 视觉相似检测 (pHash, 阈值 {threshold})')
@@ -942,8 +981,16 @@ def menu(db_path):
             except ValueError:
                 threshold = DEFAULT_THRESHOLD
             threshold = max(0, min(64, threshold))
+
+            skip_walk = False
+            if not fresh and n_files > 0:
+                # 断点续扫时，询问是否跳过磁盘重新遍历，直接继续未完成的哈希/聚类阶段
+                check_disk = prompt('重新检查磁盘目录变动? (y/n, 选 n 则直接继续未完成阶段)', 'n').lower()
+                skip_walk = (check_disk != 'y')
+
             try:
-                run_scan(root, db_path, fresh, visual, threshold, workers, interactive=True, auto_skip_errors=auto_skip_errors)
+                run_scan(root, db_path, fresh, visual, threshold, workers, interactive=True,
+                         auto_skip_errors=auto_skip_errors, skip_walk=skip_walk)
             except KeyboardInterrupt:
                 print('\n已中断。下次选择 [1] 可从断点继续, 已完成的结果保存在数据库中。')
         elif choice == '3':
@@ -978,6 +1025,7 @@ def main():
     p_scan.add_argument('--threshold', type=int, default=DEFAULT_THRESHOLD, help='汉明距离阈值')
     p_scan.add_argument('--workers', type=int, default=4)
     p_scan.add_argument('--auto-skip-errors', action='store_true', help='遇到错误自动跳过，不暂停要求输入r重试')
+    p_scan.add_argument('--skip-walk', action='store_true', help='跳过磁盘遍历，直接对数据库已有文件继续哈希/聚类')
 
     sub.add_parser('export', help='导出重复列表 (CSV + Markdown)')
 
@@ -987,7 +1035,8 @@ def main():
         try:
             sys.exit(run_scan(args.root, args.db, args.fresh, not args.no_visual,
                               args.threshold, args.workers, interactive=False,
-                              auto_skip_errors=args.auto_skip_errors))
+                              auto_skip_errors=args.auto_skip_errors,
+                              skip_walk=args.skip_walk))
         except KeyboardInterrupt:
             print('\n已中断。下次运行可断点续扫。')
             sys.exit(130)
