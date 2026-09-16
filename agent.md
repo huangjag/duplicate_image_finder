@@ -26,6 +26,7 @@ duplicate_image_finder/
 │
 ├── requirements.txt                  # Production dependencies (pillow, imagehash, tqdm, numpy)
 ├── install_dependencies.bat          # Windows batch script for automated dependency setup
+├── README.md                         # User documentation, feature overview & usage guide
 │
 ├── image_dedup.db                    # SQLite cache database (created/updated at runtime)
 │
