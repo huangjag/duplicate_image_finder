@@ -25,8 +25,7 @@ duplicate_image_finder/
 ├── duplicate_image_finder_v2.py      # [Main] Production duplicate finder with SQLite & SIMD clustering
 │
 ├── requirements.txt                  # Production dependencies (pillow, imagehash, tqdm, numpy)
-├── dependencies.md                   # Environment and deployment guide
-├── chat_history_2026-09-01_17-21.md  # Historical chat log
+├── install_dependencies.bat          # Windows batch script for automated dependency setup
 │
 ├── image_dedup.db                    # SQLite cache database (created/updated at runtime)
 │
@@ -152,6 +151,7 @@ Menu options:
 - `[4]`: Temporary isolated scan (runs in `image_dedup_temp.db` without contaminating main DB, exports `_temp` reports).
 - `[5]`: Optimize & clean database (defragments SQLite pages via `VACUUM` & rebuilds statistics via `ANALYZE`).
 - `[6]`: Toggle error handling mode (Pause for `r` retry vs. Auto-skip errors).
+- `[7]`: Clean Mac junk files (safely scans and deletes `._*` AppleDouble and `.DS_Store` files with confirmation).
 - `[0]`: Exit.
 
 #### Command-Line Mode
@@ -182,6 +182,9 @@ python duplicate_image_finder_v2.py export
 
 # Optimize and defragment SQLite database
 python duplicate_image_finder_v2.py clean-db
+
+# Clean macOS metadata junk files (._* and .DS_Store)
+python duplicate_image_finder_v2.py clean-junk "E:\photos"
 ```
 
 #### Output Artifacts:

@@ -7,10 +7,12 @@
 特性:
   * 交互菜单:
       [1] 开始/继续查找(断点续扫)  [2] 重新扫描主库  [3] 导出列表(CSV+Markdown)
-      [4] 临时隔离扫描(不污染主库, 导出 _temp 报告)  [5] 优化与清理数据库  [6] 切换错误重试模式
+      [4] 临时隔离扫描(不污染主库, 导出 _temp 报告)  [5] 优化与清理数据库
+      [6] 切换错误重试模式  [7] 清理 Mac 垃圾文件(._* 与 .DS_Store)
   * 终端单行动态更新: 原地更新单行进度与当前文件，绝不换行滚动刷屏，保留全部历史日志
   * 智能断点续扫: 支持跳过磁盘重遍历，直达未完成阶段 (文件头/整文件/SIMD感知哈希聚类)
-  * 容错与重试: 遇到读取失败时可暂停提示输入 'r' 重试，也可一键切换为自动跳过
+  * 容错与重试: 遇错暂停时可输入 'r' 重试 / 'a' 跳过本次运行所有错误, 也可用选项 6 永久切换自动跳过
+  * Mac 垃圾免疫: 自动跳过 macOS 拷贝产生的 ._xxx (AppleDouble) 元数据文件, 不会误报 UnidentifiedImageError
   * 分级漏斗加速: 文件大小 -> 文件头哈希 (64KB) -> 整文件哈希 (BLAKE2b-128) -> (可选)感知哈希 (pHash)
   * NumPy SIMD 硬件级向量化 (POPCNT) 多线程块并行快速相似聚类
 
@@ -31,6 +33,7 @@
   python duplicate_image_finder_v2.py scan <目录> --no-visual  # 只查字节级重复
   python duplicate_image_finder_v2.py export                   # 导出报告
   python duplicate_image_finder_v2.py clean-db                 # 优化与清理数据库
+  python duplicate_image_finder_v2.py clean-junk <目录>        # 清理 macOS 垃圾文件 (._* 与 .DS_Store)
 """
 
 import argparse
@@ -80,6 +83,14 @@ DEFAULT_THRESHOLD = 6         # 汉明距离阈值(0=完全一致, 建议 5~8)
 
 KIND_EXACT = '内容重复'
 KIND_VISUAL = '视觉相似'
+
+# 会话级错误处理: 报错提示中输入 'a' 后, 本次运行剩余所有错误自动跳过 (仅当次运行生效, 不改动菜单选项 6)
+_session_auto_skip = [False]
+
+
+def _auto_skip_now(auto_skip_errors: bool) -> bool:
+    """菜单选项 6 的永久开关(auto_skip_errors) 或本次运行中输入 'a' 均可触发自动跳过"""
+    return auto_skip_errors or _session_auto_skip[0]
 
 # ------------------- Windows OneDrive 占位文件检测 -------------------
 
@@ -281,11 +292,94 @@ def clean_database(db_path: str):
     print(f'  释放磁盘空间: {freed / 1048576:.2f} MB')
     print('=' * 50)
 
+
+def clean_mac_junk(root: str, db_path: str = None) -> int:
+    """扫描并删除 macOS 拷贝到非 Mac 文件系统时产生的垃圾文件:
+    ._xxx (AppleDouble 元数据文件, 会导致 PIL 报 UnidentifiedImageError) 与 .DS_Store。
+    删除前列出清单并要求确认; 删除后同步移除主数据库中对应的记录。"""
+    root = os.path.abspath(root)
+    if not os.path.isdir(root):
+        print(f'错误: 目录不存在 - {root}')
+        return 1
+
+    print('\n' + '=' * 50)
+    print('        清理 macOS 垃圾文件')
+    print('=' * 50)
+    print(f'扫描目录: {root}')
+    print('目标文件: ._*.xxx (AppleDouble 元数据) 与 .DS_Store')
+    print('-' * 50)
+
+    junk = []   # (路径, 大小)
+    t0 = time.time()
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            if is_mac_junk(fn):
+                p = os.path.join(dirpath, fn)
+                try:
+                    junk.append((p, os.path.getsize(p)))
+                except OSError:
+                    junk.append((p, 0))
+
+    if not junk:
+        print(f'[完成] 未发现 macOS 垃圾文件, 目录很干净 (耗时 {time.time() - t0:.1f} 秒)。')
+        return 0
+
+    total_size = sum(s for _, s in junk)
+    print(f'发现 {len(junk):,} 个垃圾文件, 共占用 {total_size / 1048576:.2f} MB (扫描耗时 {time.time() - t0:.1f} 秒)')
+    for p, s in junk[:10]:
+        print(f'  - {p} ({s / 1024:.1f} KB)')
+    if len(junk) > 10:
+        print(f'  ... 以及另外 {len(junk) - 10:,} 个文件')
+
+    if input(f'\n确认永久删除以上 {len(junk):,} 个垃圾文件? (yes/no): ').strip().lower() != 'yes':
+        print('已取消, 未删除任何文件。')
+        return 0
+
+    t1 = time.time()
+    deleted, failed, freed = 0, 0, 0
+    deleted_paths = []
+    for p, s in junk:
+        try:
+            os.remove(p)
+            deleted += 1
+            freed += s
+            deleted_paths.append(p)
+        except OSError as e:
+            failed += 1
+            print(f'  [删除失败] {p}: {e}')
+    print(f'\n[清理完成] 耗时 {time.time() - t1:.1f} 秒')
+    print(f'  已删除:       {deleted:,} 个文件')
+    print(f'  释放磁盘空间: {freed / 1048576:.2f} MB')
+    if failed:
+        print(f'  删除失败:     {failed:,} 个 (通常是文件被占用, 关闭相关程序后重试)')
+
+    # 同步主数据库: 移除已删除文件对应的记录 (即使不同步, 下次完整扫描也会自动校正)
+    if deleted_paths and db_path and os.path.exists(db_path):
+        try:
+            conn = open_db(os.path.abspath(db_path))
+            for i in range(0, len(deleted_paths), BATCH):
+                qm = ','.join('?' * len(deleted_paths[i:i + BATCH]))
+                conn.execute(f'DELETE FROM files WHERE path IN ({qm})', deleted_paths[i:i + BATCH])
+            conn.commit()
+            conn.close()
+            print(f'  主数据库已同步, 移除 {len(deleted_paths):,} 条对应记录。')
+        except Exception as e:
+            print(f'  [提示] 主数据库同步失败 (不影响本次清理, 下次扫描会自动校正): {e}')
+    print('=' * 50)
+    return 0
+
 # ----------------------------- 目录遍历 -----------------------------
 
 
-def walk_images(root: str):
-    """确定性(按名称排序)递归遍历, 产出图片文件路径"""
+def is_mac_junk(name: str) -> bool:
+    """macOS 拷贝到非 Mac 文件系统时产生的垃圾文件:
+    ._xxx 为 AppleDouble 元数据文件 (不是图片, PIL 无法解码), .DS_Store 为 Finder 设置文件"""
+    return name.startswith('._') or name == '.DS_Store'
+
+
+def walk_images(root: str, junk_counter=None):
+    """确定性(按名称排序)递归遍历, 产出图片文件路径 (自动跳过 macOS 垃圾文件)。
+    junk_counter 为可选 [计数] 容器, 用于统计发现的垃圾文件数。"""
     stack = [root]
     while stack:
         d = stack.pop()
@@ -299,6 +393,10 @@ def walk_images(root: str):
                 if entry.is_dir(follow_symlinks=False):
                     stack.append(entry.path)
                 elif entry.is_file(follow_symlinks=False):
+                    if is_mac_junk(entry.name):
+                        if junk_counter is not None:
+                            junk_counter[0] += 1
+                        continue
                     if os.path.splitext(entry.name)[1].lower() in IMAGE_EXTS:
                         yield entry.path
             except OSError:
@@ -306,8 +404,9 @@ def walk_images(root: str):
 
 
 def enumerate_into_db(conn, root: str, db_abs: str, auto_skip_errors: bool = False):
-    """遍历目录并同步到数据库。返回 (总数, 新增, 变化, 删除, 占位跳过, 出错)"""
+    """遍历目录并同步到数据库。返回 (总数, 新增, 变化, 删除, 占位跳过, 出错, Mac垃圾跳过)"""
     added = changed = deleted = skipped_ph = stat_err = 0
+    mac_junk = [0]
     seen = set()
     batch = []
 
@@ -346,7 +445,7 @@ def enumerate_into_db(conn, root: str, db_abs: str, auto_skip_errors: bool = Fal
 
     bar = SingleLineReporter(0, '[1/4] 遍历目录')
     try:
-        for path in walk_images(root):
+        for path in walk_images(root, mac_junk):
             if os.path.abspath(path) == db_abs:
                 continue
             if is_placeholder(path):
@@ -358,15 +457,20 @@ def enumerate_into_db(conn, root: str, db_abs: str, auto_skip_errors: bool = Fal
                     st = os.stat(path)
                     break
                 except Exception as e:
-                    if auto_skip_errors:
+                    if _auto_skip_now(auto_skip_errors):
                         stat_err += 1
                         break
                     bar.clear()
                     print(f'\n[文件扫描失败] 无法读取文件状态: {path}')
                     print(f'  错误原因: {type(e).__name__}: {e}')
-                    choice = input("  输入 'r' 重试此文件，按其他键或直接回车跳过: ").strip().lower()
+                    choice = input("  输入 'r' 重试此文件，输入 'a' 跳过本次所有错误，按其他键或直接回车跳过: ").strip().lower()
                     if choice == 'r':
                         continue
+                    elif choice == 'a':
+                        _session_auto_skip[0] = True
+                        stat_err += 1
+                        print('  --> [已切换] 本次运行后续所有错误将自动跳过。\n')
+                        break
                     else:
                         stat_err += 1
                         break
@@ -391,7 +495,7 @@ def enumerate_into_db(conn, root: str, db_abs: str, auto_skip_errors: bool = Fal
     conn.commit()
 
     total = db_file_count(conn)
-    return total, added, changed, deleted or 0, skipped_ph, stat_err
+    return total, added, changed, deleted or 0, skipped_ph, stat_err, mac_junk[0]
 
 # ----------------------------- 工作进程与单文件哈希 -----------------------------
 
@@ -497,13 +601,13 @@ def _run_stage(conn, sql, worker_fn, mode, workers, desc, auto_skip_errors=False
                         updates.append((digest, fid))
                         results.append((fid, digest, None))
                     else:
-                        if not auto_skip_errors:
+                        if not _auto_skip_now(auto_skip_errors):
                             bar.clear()
                             print(f'\n[文件处理失败] 路径: {path}')
                             print(f'  错误原因: {err}')
                             retried = False
                             while True:
-                                choice = input("  输入 'r' 重试此文件，按其他键或直接回车跳过: ").strip().lower()
+                                choice = input("  输入 'r' 重试此文件，输入 'a' 跳过本次所有错误，按其他键或直接回车跳过: ").strip().lower()
                                 if choice == 'r':
                                     try:
                                         digest = compute_single_hash(mode, path)
@@ -514,6 +618,10 @@ def _run_stage(conn, sql, worker_fn, mode, workers, desc, auto_skip_errors=False
                                         break
                                     except Exception as retry_e:
                                         print(f'  --> [重试仍失败]: {type(retry_e).__name__}: {retry_e}')
+                                elif choice == 'a':
+                                    _session_auto_skip[0] = True
+                                    print('  --> [已切换] 本次运行后续所有错误将自动跳过。\n')
+                                    break
                                 else:
                                     break
                             if not retried:
@@ -656,7 +764,9 @@ def stage_visual(conn, workers, threshold, skip_if_clean, auto_skip_errors=False
 
     n_new, fails, _ = _run_stage(
         conn,
-        'SELECT r.id, f.path FROM reps r JOIN files f ON f.id=r.id WHERE f.phash IS NULL',
+        # 过滤 macOS AppleDouble 垃圾文件 (旧版本索引过的 ._xxx 不会解码报错, 也不参与视觉分组)
+        'SELECT r.id, f.path FROM reps r JOIN files f ON f.id=r.id '
+        "WHERE f.phash IS NULL AND substr(f.name,1,2) != '._'",
         phash_chunk, None, workers, '[4/4] 计算感知哈希 pHash', auto_skip_errors=auto_skip_errors)
     if fails:
         print(f'[提示] {fails} 张图片无法解码, 已记录错误并跳过')
@@ -866,6 +976,7 @@ def export_report(conn, out_dir, echo=True, suffix=''):
 def run_scan(root, db_path, fresh, visual, threshold, workers, interactive,
              auto_skip_errors=False, skip_walk=False, report_suffix=''):
     root = os.path.abspath(root)
+    _session_auto_skip[0] = False   # 输入 'a' 的跳过仅本次运行生效, 每次扫描开始时重置
     if not os.path.isdir(root):
         print(f'错误: 目录不存在 - {root}')
         return 1
@@ -897,11 +1008,11 @@ def run_scan(root, db_path, fresh, visual, threshold, workers, interactive,
         changed_total = 0
         print(f'[1/4] 遍历目录: 已跳过 (直接使用数据库已有的 {total:,} 个文件索引)')
     else:
-        total, added, changed, deleted, ph_skip, stat_err = enumerate_into_db(
+        total, added, changed, deleted, ph_skip, stat_err, mac_skip = enumerate_into_db(
             conn, root, db_abs, auto_skip_errors=auto_skip_errors)
         changed_total = added + changed + deleted
         print(f'  索引统计: 共 {total:,} 个图片文件 | 新增 {added:,} | 变化 {changed:,} | 已删除 {deleted:,} '
-              f'| OneDrive占位跳过 {ph_skip:,} | 读取失败 {stat_err:,}')
+              f'| OneDrive占位跳过 {ph_skip:,} | Mac垃圾跳过 {mac_skip:,} | 读取失败 {stat_err:,}')
     if total < 2:
         print('文件不足, 无需比较。')
         return 0
@@ -1014,6 +1125,7 @@ def menu(db_path):
         print(' [4] 临时隔离扫描 (使用临时数据库, 不污染主库, 导出 _temp 报告)')
         print(' [5] 优化与清理数据库 (VACUUM 整理碎片 & 索引优化)')
         print(f' [6] 切换错误处理模式 (当前: {"自动跳过" if auto_skip_errors else "暂停重试"})')
+        print(' [7] 清理 Mac 垃圾文件 (删除扫描目录中的 ._*.xxx 与 .DS_Store, 删除前需确认)')
         print(' [0] 退出')
         choice = input('请选择: ').strip()
 
@@ -1045,7 +1157,14 @@ def menu(db_path):
             if auto_skip_errors:
                 print('\n[已设置] 遇到读取错误时将【自动跳过并记录】，不暂停重试。')
             else:
-                print('\n[已设置] 遇到读取错误时将【暂停并提示输入 r 重试】。')
+                print('\n[已设置] 遇到读取错误时将【暂停并提示输入 r 重试 (或输入 a 跳过本次所有错误)】。')
+            continue
+        elif choice == '7':
+            root = prompt('要清理的目录', last_root or '.')
+            try:
+                clean_mac_junk(root, db_path)
+            except KeyboardInterrupt:
+                print('\n清理已中断。')
             continue
         elif choice in ('1', '2'):
             fresh = choice == '2'
@@ -1113,6 +1232,8 @@ def main():
 
     sub.add_parser('export', help='导出重复列表 (CSV + Markdown)')
     sub.add_parser('clean-db', help='优化并整理数据库碎片 (VACUUM & ANALYZE)')
+    p_clean = sub.add_parser('clean-junk', help='删除目录中的 macOS 垃圾文件 (._* 与 .DS_Store, 删除前需确认)')
+    p_clean.add_argument('root', help='要清理的目录')
 
     args = parser.parse_args()
 
@@ -1146,6 +1267,8 @@ def main():
             conn.close()
     elif args.cmd == 'clean-db':
         clean_database(args.db)
+    elif args.cmd == 'clean-junk':
+        sys.exit(clean_mac_junk(args.root, args.db))
     else:
         try:
             menu(args.db)
