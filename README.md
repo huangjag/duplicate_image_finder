@@ -31,7 +31,7 @@ To avoid expensive image decoding across millions of files, the pipeline filters
 - **Temporary Isolated Scanning**: Scan folders into an isolated temporary database (`image_dedup_temp.db`) and generate `_temp` reports without affecting the main database.
 - **Database Maintenance (`clean-db`)**: Optimize and defragment SQLite storage via `VACUUM` and update optimizer statistics with `ANALYZE`.
 - **macOS Junk Purge (`clean-junk`)**: Search and safely remove `._*` and `.DS_Store` files from any directory with interactive confirmation and automatic database cleanup.
-- **Safe Duplicate Deletion (menu `[8]`)**: Remove redundant duplicates from the scan results, keeping exactly one file per group (`largest size` → `newest date` → `largest filename`). Deleted files go to the **OS Recycle Bin** (recoverable), the SQLite index is synced automatically, and reclaimed disk space is reported.
+- **Safe Duplicate Deletion (menu `[8]`)**: Remove redundant duplicates from the scan results, keeping exactly one file per group (`largest size` → `newest date` → `largest filename`). Works on either the **main database** or a kept **temporary scan database**. Deleted files go to the **OS Recycle Bin** (recoverable), the SQLite index is synced automatically, and reclaimed disk space is reported.
 
 ---
 
@@ -92,7 +92,7 @@ An interactive menu will be displayed:
  [5] 优化与清理数据库 (VACUUM 整理碎片 & 索引优化)
  [6] 切换错误处理模式 (当前: 暂停重试)
  [7] 清理 Mac 垃圾文件 (删除扫描目录中的 ._*.xxx 与 .DS_Store, 删除前需确认)
- [8] 删除重复文件 (每组保留 1 个: 体积最大>日期最新>文件名最大; 移入回收站)
+ [8] 删除重复文件 (可选主库/临时库; 每组保留 1 个: 体积最大>日期最新>文件名最大; 移入回收站)
  [0] 退出
 ```
 
@@ -103,7 +103,7 @@ An interactive menu will be displayed:
 - **Option [5] (Optimize DB)**: Runs `VACUUM` and `ANALYZE` on the SQLite database to reclaim disk space and rebuild indexes.
 - **Option [6] (Toggle Error Mode)**: Switches between interactive error prompt (`r` retry / `a` skip all) and silent auto-skip.
 - **Option [7] (Clean Mac Junk)**: Scans for macOS `._*` and `.DS_Store` junk files, shows a summary, and asks for confirmation before deleting.
-- **Option [8] (Delete Duplicates)**: Deletes redundant duplicates from the scan results, keeping exactly one file per group. It first shows the database path and the scanned root directory; if the database is empty it prompts you to scan first and returns to the menu. You then choose which category to delete (`1` Exact / `2` Visual / `3` Both). Files are sent to the **OS Recycle Bin** (recoverable), the SQLite index is synced, and reclaimed space is reported. See the retention policy below.
+- **Option [8] (Delete Duplicates)**: Deletes redundant duplicates from the scan results, keeping exactly one file per group. It works on **both the main database and a temporary scan database**: if a previous temporary scan was kept (`image_dedup_temp.db`), you are asked whether to process the main DB or the temp DB. It then shows the database path and the scanned root directory; if the database is empty it prompts you to scan first (main → option `1`/`2`, temp → option `4`) and returns to the menu. You then choose which category to delete (`1` Exact / `2` Visual / `3` Both). Files are sent to the **OS Recycle Bin** (recoverable), the SQLite index is synced, and reclaimed space is reported. See the retention policy below.
   - **Retention policy (keep exactly one per group)**: ① largest file size → ② newest modification date (**date only**, time-of-day ignored) → ③ largest filename within the same date (lexicographic, case-insensitive).
 
 ---

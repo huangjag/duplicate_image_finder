@@ -153,7 +153,7 @@ Menu options:
 - `[5]`: Optimize & clean database (defragments SQLite pages via `VACUUM` & rebuilds statistics via `ANALYZE`).
 - `[6]`: Toggle error handling mode (Pause for `r` retry vs. Auto-skip errors).
 - `[7]`: Clean Mac junk files (safely scans and deletes `._*` AppleDouble and `.DS_Store` files with confirmation).
-- `[8]`: Delete duplicate files from scan results (keeps exactly one file per duplicate group per the retention policy, sends the rest to the OS Recycle Bin, syncs the index, and reports reclaimed space).
+- `[8]`: Delete duplicate files from scan results (keeps exactly one file per duplicate group per the retention policy, sends the rest to the OS Recycle Bin, syncs the index, and reports reclaimed space). Operates on **either the main DB or a kept temporary scan DB** — if `image_dedup_temp.db` exists, the menu first asks which one to use.
 - `[0]`: Exit.
 
 #### Command-Line Mode
@@ -206,7 +206,7 @@ When modifying, debugging, or adding features to this codebase, adhere to the fo
 
 ### 7.2 Adding New Features
 - **Automated Deletion (implemented — interactive menu `[8]`, `delete_duplicates`)**:
-  - Entry point: interactive menu `[8]` only (no CLI subcommand). It prints the database path and its `root` metadata, and returns to the menu if the database has zero files. The operator picks the category at runtime (`1` exact `full_hash` / `2` visual `visual_group` / `3` both).
+  - Entry point: interactive menu `[8]` only (no CLI subcommand). **Target DB selection**: the temp DB path is derived as `os.path.join(os.path.dirname(os.path.abspath(db_path)), TEMP_DB_FILENAME)`; if it exists, the menu status shows a `临时数据库` line with its indexed count, and `[8]` asks `[1] 主库 / [2] 临时库` before opening. `delete_duplicates` then prints the DB path (labelled `[主库]`/`[临时库]`) plus its `root` metadata, and returns to the menu if the DB has zero files (the hint points to option `4` for the temp DB). The operator picks the category at runtime (`1` exact `full_hash` / `2` visual `visual_group` / `3` both).
   - **Retention policy — keep exactly one per group (descending max)**: ① largest `size` → ② newest `mtime` **date only** (year/month/day via `time.localtime`, time-of-day ignored) → ③ largest `name` lexicographically, case-insensitive (`name.lower()`). Implemented in `_recycle_key`.
   - **Deletion is recoverable**: files are sent to the OS Recycle Bin, never permanently erased. `move_to_trash` degrades as `send2trash` → Windows `shell32.SHFileOperationW` (`FOF_ALLOWUNDO`) → `os.remove`, returning `(deleted, failed, skipped)`.
   - **Judge success by filesystem state, not the return code**: `SHFileOperationW`'s return value is unreliable (it can return non-zero even after a successful delete), so per-path success is decided by `os.path.exists()`.

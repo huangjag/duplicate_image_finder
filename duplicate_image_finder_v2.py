@@ -9,7 +9,7 @@
       [1] 开始/继续查找(断点续扫)  [2] 重新扫描主库  [3] 导出列表(CSV+Markdown)
       [4] 临时隔离扫描(不污染主库, 导出 _temp 报告)  [5] 优化与清理数据库
       [6] 切换错误重试模式  [7] 清理 Mac 垃圾文件(._* 与 .DS_Store)
-      [8] 删除重复文件(移入回收站; 保留: 体积最大>日期最新>文件名最大)
+      [8] 删除重复文件(可选主库/临时库, 移入回收站; 保留: 体积最大>日期最新>文件名最大)
   * 终端单行动态更新: 原地更新单行进度与当前文件，绝不换行滚动刷屏，保留全部历史日志
   * 智能断点续扫: 支持跳过磁盘重遍历，直达未完成阶段 (文件头/整文件/SIMD感知哈希聚类)
   * 容错与重试: 遇错暂停时可输入 'r' 重试 / 'a' 跳过本次运行所有错误, 也可用选项 6 永久切换自动跳过
@@ -519,19 +519,22 @@ def delete_duplicates(conn, db_path, sample_limit=10):
     """依据扫描结果删除重复文件: 每组仅保留 1 个, 其余移入系统回收站。
     保留优先级: ①体积最大 > ②修改日期最新(只看日期) > ③同日期文件名最大(字典序, 忽略大小写)。"""
     db_abs = os.path.abspath(db_path)
+    is_temp = os.path.basename(db_abs) == TEMP_DB_FILENAME
+    kind = '临时库' if is_temp else '主库'
     root = get_meta(conn, 'root')
     n_files = db_file_count(conn)
 
     print('\n' + '=' * 60)
     print('              删除重复文件 (移入系统回收站)')
     print('=' * 60)
-    print(f'当前数据库:   {db_abs}')
+    print(f'当前数据库:   {db_abs}  [{kind}]')
     print(f'数据库路径:   {root or "未设置"}')
     print('保留规则:     ①体积最大 > ②日期最新(只看日期) > ③同日期文件名最大(忽略大小写)')
 
     if n_files == 0:
+        hint = '请先执行临时隔离扫描 (选项 4)' if is_temp else '请先执行扫描 (选项 1 或 2)'
         print('-' * 60)
-        print('[提示] 数据库为空, 请先执行扫描 (选项 1 或 2) 后再进行删除。')
+        print(f'[提示] 数据库为空, {hint} 后再进行删除。')
         print('=' * 60)
         return
 
@@ -1354,10 +1357,21 @@ def menu(db_path):
         last_root = get_meta(conn, 'root')
         n_files = db_file_count(conn)
         conn.close()
+        temp_db_path = os.path.join(os.path.dirname(os.path.abspath(db_path)) or '.', TEMP_DB_FILENAME)
+        temp_info = None
+        if os.path.exists(temp_db_path):
+            try:
+                tconn = open_db(temp_db_path)
+                temp_info = db_file_count(tconn)
+                tconn.close()
+            except Exception:
+                temp_info = 0
         print('\n' + '=' * 50)
         print('        重复图片查找工具 (海量文件版)')
         print('=' * 50)
         print(f'主缓存数据库: {db_path} (已索引 {n_files:,} 个文件)')
+        if temp_info is not None:
+            print(f'临时数据库:   {TEMP_DB_FILENAME} (已索引 {temp_info:,} 个文件)')
         print(f'上次扫描目录: {last_root or "未设置"}')
         mode_label = '自动跳过错误(不暂停)' if auto_skip_errors else '遇错暂停(提示输入 r 重试)'
         print(f'错误处理模式: {mode_label}')
@@ -1369,7 +1383,7 @@ def menu(db_path):
         print(' [5] 优化与清理数据库 (VACUUM 整理碎片 & 索引优化)')
         print(f' [6] 切换错误处理模式 (当前: {"自动跳过" if auto_skip_errors else "暂停重试"})')
         print(' [7] 清理 Mac 垃圾文件 (删除扫描目录中的 ._*.xxx 与 .DS_Store, 删除前需确认)')
-        print(' [8] 删除重复文件 (每组保留 1 个: 体积最大>日期最新>文件名最大; 移入回收站)')
+        print(' [8] 删除重复文件 (可选主库/临时库; 每组保留 1 个: 体积最大>日期最新>文件名最大; 移入回收站)')
         print(' [0] 退出')
         choice = input('请选择: ').strip()
 
@@ -1450,9 +1464,18 @@ def menu(db_path):
             finally:
                 conn.close()
         elif choice == '8':
-            conn = open_db(os.path.abspath(db_path))
+            target_db = db_path
+            if temp_info is not None:
+                print(f'\n检测到临时数据库: {temp_db_path} (已索引 {temp_info:,} 个文件)')
+                sel = input('选择要删除重复文件的数据库? [1] 主库  [2] 临时库 : ').strip()
+                if sel == '2':
+                    target_db = temp_db_path
+                elif sel != '1':
+                    print('无效选择, 已取消。')
+                    continue
+            conn = open_db(os.path.abspath(target_db))
             try:
-                delete_duplicates(conn, db_path)
+                delete_duplicates(conn, target_db)
             except KeyboardInterrupt:
                 print('\n删除已中断。')
             finally:
