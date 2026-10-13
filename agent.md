@@ -153,6 +153,7 @@ Menu options:
 - `[5]`: Optimize & clean database (defragments SQLite pages via `VACUUM` & rebuilds statistics via `ANALYZE`).
 - `[6]`: Toggle error handling mode (Pause for `r` retry vs. Auto-skip errors).
 - `[7]`: Clean Mac junk files (safely scans and deletes `._*` AppleDouble and `.DS_Store` files with confirmation).
+- `[8]`: Delete duplicate files from scan results (keeps exactly one file per duplicate group per the retention policy, sends the rest to the OS Recycle Bin, syncs the index, and reports reclaimed space).
 - `[0]`: Exit.
 
 #### Command-Line Mode
@@ -204,12 +205,14 @@ When modifying, debugging, or adding features to this codebase, adhere to the fo
 - **Preserving Resume Capability**: Always reset `prefix_hash=NULL, full_hash=NULL, phash=NULL, visual_group=NULL` when a file's `size` or `mtime` changes.
 
 ### 7.2 Adding New Features
-- **Implementing Automated Deletion in v2**:
-  - If adding automated deletion to `v2`, ensure it defaults to **dry-run** mode.
-  - Deletion rules should prioritize:
-    1. Exact content duplicates (`full_hash` matches) first.
-    2. Respect retention policies: `largest` (highest file size), `resolution` (highest image width $\times$ height), or `path_priority` (keep originals in specified folders).
-    3. Update `files` table or delete rows upon file removal.
+- **Automated Deletion (implemented — interactive menu `[8]`, `delete_duplicates`)**:
+  - Entry point: interactive menu `[8]` only (no CLI subcommand). It prints the database path and its `root` metadata, and returns to the menu if the database has zero files. The operator picks the category at runtime (`1` exact `full_hash` / `2` visual `visual_group` / `3` both).
+  - **Retention policy — keep exactly one per group (descending max)**: ① largest `size` → ② newest `mtime` **date only** (year/month/day via `time.localtime`, time-of-day ignored) → ③ largest `name` lexicographically, case-insensitive (`name.lower()`). Implemented in `_recycle_key`.
+  - **Deletion is recoverable**: files are sent to the OS Recycle Bin, never permanently erased. `move_to_trash` degrades as `send2trash` → Windows `shell32.SHFileOperationW` (`FOF_ALLOWUNDO`) → `os.remove`, returning `(deleted, failed, skipped)`.
+  - **Judge success by filesystem state, not the return code**: `SHFileOperationW`'s return value is unreliable (it can return non-zero even after a successful delete), so per-path success is decided by `os.path.exists()`.
+  - For `both` mode, a `scheduled` set prevents the same file from being scheduled twice (exact group first, then visual group).
+  - After deletion, purge the corresponding `files` rows in `BATCH`-sized chunks (`DELETE ... WHERE path IN (...)`, incl. already-missing paths) and `commit()`.
+  - **Guideline for future retention options** (e.g. `resolution` = highest width×height, or `path_priority` = keep originals in specified folders): add them as new key components in `_recycle_key` rather than rewriting the loop.
 - **Adding Custom Hashes / Embeddings**:
   - For semantic/deep learning embeddings (e.g. CLIP), add an `embedding BLOB` column to `files` table.
   - Implement a dedicated stage after `stage_full_hash` to only embed unique file representatives.

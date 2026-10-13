@@ -9,6 +9,7 @@
       [1] 开始/继续查找(断点续扫)  [2] 重新扫描主库  [3] 导出列表(CSV+Markdown)
       [4] 临时隔离扫描(不污染主库, 导出 _temp 报告)  [5] 优化与清理数据库
       [6] 切换错误重试模式  [7] 清理 Mac 垃圾文件(._* 与 .DS_Store)
+      [8] 删除重复文件(移入回收站; 保留: 体积最大>日期最新>文件名最大)
   * 终端单行动态更新: 原地更新单行进度与当前文件，绝不换行滚动刷屏，保留全部历史日志
   * 智能断点续扫: 支持跳过磁盘重遍历，直达未完成阶段 (文件头/整文件/SIMD感知哈希聚类)
   * 容错与重试: 遇错暂停时可输入 'r' 重试 / 'a' 跳过本次运行所有错误, 也可用选项 6 永久切换自动跳过
@@ -367,6 +368,248 @@ def clean_mac_junk(root: str, db_path: str = None) -> int:
             print(f'  [提示] 主数据库同步失败 (不影响本次清理, 下次扫描会自动校正): {e}')
     print('=' * 50)
     return 0
+
+# ----------------------------- 删除重复文件 -----------------------------
+
+
+def _recycle_key(row):
+    """删除重复文件时的保留优先级键 (降序取最大者即为要保留的文件):
+      ① 体积最大  ② 修改日期最新(只看日期, 忽略时/分/秒)  ③ 同日期文件名最大(字典序, 忽略大小写)。
+    row = (id, name, path, size, mtime, group_key)"""
+    size = row[3]
+    mtime = row[4]
+    name = row[1]
+    try:
+        lt = time.localtime(mtime)
+        date_key = (lt.tm_year, lt.tm_mon, lt.tm_mday)
+    except (ValueError, OSError, TypeError):
+        date_key = (0, 0, 0)
+    return (size, date_key, str(name).lower())
+
+
+def _trash_send2trash(paths):
+    """使用 send2trash 库将文件移入系统回收站 (跨平台, 支持长路径)。"""
+    from send2trash import send2trash
+    deleted, failed = [], []
+    for p in paths:
+        try:
+            send2trash(os.path.abspath(p))
+            deleted.append(p)
+        except Exception as e:
+            failed.append((p, f'{type(e).__name__}: {e}'))
+    return deleted, failed
+
+
+if sys.platform == 'win32':
+    _FO_DELETE = 3
+    _FOF_SILENT = 0x0004
+    _FOF_NOCONFIRMATION = 0x0010
+    _FOF_ALLOWUNDO = 0x0040      # 关键: 移入回收站而非永久删除
+    _FOF_NOERRORUI = 0x0400
+
+    def _trash_windows(paths):
+        """使用 shell32.SHFileOperationW (FOF_ALLOWUNDO) 将文件移入 Windows 回收站。
+        分批调用; 整批失败时降级为逐文件重试, 以精确区分成功/失败。"""
+        from ctypes import wintypes
+
+        class SHFILEOPSTRUCTW(ctypes.Structure):
+            _fields_ = [
+                ('hwnd', wintypes.HWND),
+                ('wFunc', wintypes.UINT),
+                ('pFrom', wintypes.LPCWSTR),
+                ('pTo', wintypes.LPCWSTR),
+                ('fFlags', ctypes.c_ushort),
+                ('fAnyOperationsAborted', wintypes.BOOL),
+                ('hNameMappings', ctypes.c_void_p),
+                ('lpszProgressTitle', wintypes.LPCWSTR),
+            ]
+
+        shell32 = ctypes.WinDLL('shell32', use_last_error=True)
+        shell32.SHFileOperationW.argtypes = [ctypes.POINTER(SHFILEOPSTRUCTW)]
+        shell32.SHFileOperationW.restype = ctypes.c_int
+
+        def _op(batch):
+            op = SHFILEOPSTRUCTW()
+            op.wFunc = _FO_DELETE
+            op.pFrom = '\0'.join(os.path.abspath(p) for p in batch) + '\0\0'
+            op.fFlags = _FOF_ALLOWUNDO | _FOF_NOCONFIRMATION | _FOF_SILENT | _FOF_NOERRORUI
+            res = shell32.SHFileOperationW(ctypes.byref(op))
+            return res, bool(op.fAnyOperationsAborted)
+
+        deleted, failed = [], []
+        for i in range(0, len(paths), 200):
+            batch = paths[i:i + 200]
+            res, aborted = _op(batch)
+            # 以文件系统实际状态判定成功: 个别环境下 SHFileOperation 返回值不可靠
+            # (可能返回非 0 但文件已删除, 也可能返回 0 但未删), 故只信 exists 检查
+            for p in batch:
+                if not os.path.exists(p):
+                    deleted.append(p)
+                elif aborted:
+                    failed.append((p, '操作被用户中止'))
+                else:
+                    failed.append((p, f'SHFileOperation 返回 {res}'))
+        return deleted, failed
+
+
+def move_to_trash(paths):
+    """将文件移入系统回收站 (可恢复)。
+    返回 (deleted, failed, skipped):
+      deleted — 已成功移入回收站 (或已永久删除) 的路径
+      failed  — [(path, err), ...] 删除失败项
+      skipped — 调用前已不存在的路径 (数据库记录仍需同步清理)
+    降级顺序: send2trash(若已安装) -> Windows SHFileOperationW(回收站) -> os.remove(永久删除)。"""
+    deleted, failed, skipped = [], [], []
+    pending = []
+    for p in paths:
+        (pending if os.path.exists(p) else skipped).append(p)
+
+    if not pending:
+        return deleted, failed, skipped
+
+    try:
+        import send2trash  # noqa: F401
+        return (*_trash_send2trash(pending), skipped)
+    except ImportError:
+        pass
+
+    if sys.platform == 'win32':
+        d, f = _trash_windows(pending)
+        return d, f, skipped
+
+    for p in pending:  # 无回收站能力, 回退永久删除
+        try:
+            os.remove(p)
+            deleted.append(p)
+        except OSError as e:
+            failed.append((p, f'{type(e).__name__}: {e}'))
+    return deleted, failed, skipped
+
+
+def _iter_delete_groups(conn, mode):
+    """按类别产出重复组, 每组为 [(id, name, path, size, mtime, group_key), ...]。
+    mode: 'exact' (内容重复) | 'visual' (视觉相似) | 'both' (两者)。"""
+    sqls = []
+    if mode in ('exact', 'both'):
+        sqls.append(
+            'SELECT f.id, f.name, f.path, f.size, f.mtime, f.full_hash '
+            'FROM files f JOIN (SELECT full_hash FROM files '
+            'WHERE full_hash IS NOT NULL GROUP BY full_hash HAVING COUNT(*)>1) d '
+            'ON f.full_hash=d.full_hash ORDER BY f.full_hash, f.id')
+    if mode in ('visual', 'both'):
+        sqls.append(
+            'SELECT f.id, f.name, f.path, f.size, f.mtime, f.visual_group '
+            'FROM files f WHERE f.visual_group IS NOT NULL '
+            'ORDER BY f.visual_group, f.id')
+
+    for sql in sqls:
+        group, key = [], None
+        for row in conn.execute(sql):
+            if group and row[5] != key:
+                if len(group) > 1:
+                    yield group
+                group = []
+            key = row[5]
+            group.append(row)
+        if len(group) > 1:
+            yield group
+
+
+def delete_duplicates(conn, db_path, sample_limit=10):
+    """依据扫描结果删除重复文件: 每组仅保留 1 个, 其余移入系统回收站。
+    保留优先级: ①体积最大 > ②修改日期最新(只看日期) > ③同日期文件名最大(字典序, 忽略大小写)。"""
+    db_abs = os.path.abspath(db_path)
+    root = get_meta(conn, 'root')
+    n_files = db_file_count(conn)
+
+    print('\n' + '=' * 60)
+    print('              删除重复文件 (移入系统回收站)')
+    print('=' * 60)
+    print(f'当前数据库:   {db_abs}')
+    print(f'数据库路径:   {root or "未设置"}')
+    print('保留规则:     ①体积最大 > ②日期最新(只看日期) > ③同日期文件名最大(忽略大小写)')
+
+    if n_files == 0:
+        print('-' * 60)
+        print('[提示] 数据库为空, 请先执行扫描 (选项 1 或 2) 后再进行删除。')
+        print('=' * 60)
+        return
+
+    print('-' * 60)
+    mode_in = input('删除哪一类重复? [1] 内容重复  [2] 视觉相似  [3] 两者 : ').strip()
+    mode = {'1': 'exact', '2': 'visual', '3': 'both'}.get(mode_in)
+    if mode is None:
+        print('无效选择, 已取消。')
+        return
+
+    groups = list(_iter_delete_groups(conn, mode))
+    if not groups:
+        label = {'exact': '内容重复', 'visual': '视觉相似', 'both': '重复'}[mode]
+        print(f'\n未发现{label}分组, 无需删除。')
+        return
+
+    # 计算删除计划 (用 scheduled 去重, 避免两者模式下同一文件被两组重复处理)
+    plan = []
+    scheduled = set()
+    for group in groups:
+        members = [m for m in group if m[2] not in scheduled]
+        if len(members) < 2:
+            continue
+        keep = max(members, key=_recycle_key)
+        dels = [m for m in members if m is not keep]
+        for m in dels:
+            scheduled.add(m[2])
+        plan.append((keep, dels))
+
+    total_del = sum(len(d) for _, d in plan)
+    total_bytes = sum(d[3] for _, ds in plan for d in ds)
+    if total_del == 0:
+        print('\n未发现可删除的重复文件, 无需删除。')
+        return
+
+    print('\n' + '-' * 60)
+    print(f'删除计划: {len(plan):,} 组, 将删除 {total_del:,} 个文件, '
+          f'预计释放约 {total_bytes / 1048576:.2f} MB')
+    print('-' * 60)
+    for keep, dels in plan[:sample_limit]:
+        kd = time.strftime('%Y-%m-%d', time.localtime(keep[4]))
+        print(f'[保留] {keep[2]}  ({keep[3]:,} 字节, {kd})')
+        for m in dels:
+            md = time.strftime('%Y-%m-%d', time.localtime(m[4]))
+            print(f'  [删除] {m[2]}  ({m[3]:,} 字节, {md})')
+    if len(plan) > sample_limit:
+        print(f'  ... 其余 {len(plan) - sample_limit:,} 组不再逐条列出 ...')
+    print('-' * 60)
+    print('开始删除 (移入回收站, 可从回收站恢复)...')
+
+    all_delete_paths = [d[2] for _, ds in plan for d in ds]
+    t0 = time.time()
+    deleted, failed, skipped = move_to_trash(all_delete_paths)
+
+    deleted_set = set(deleted)
+    freed = sum(d[3] for _, ds in plan for d in ds if d[2] in deleted_set)
+
+    # 同步数据库: 移除已删除 / 已不存在文件的记录
+    purge = list(deleted) + list(skipped)
+    if purge:
+        for i in range(0, len(purge), BATCH):
+            chunk = purge[i:i + BATCH]
+            qm = ','.join('?' * len(chunk))
+            conn.execute(f'DELETE FROM files WHERE path IN ({qm})', chunk)
+        conn.commit()
+
+    print(f'\n[删除完成] 耗时 {time.time() - t0:.1f} 秒')
+    print(f'  已移入回收站: {len(deleted):,} 个文件')
+    print(f'  释放磁盘空间: {freed / 1048576:.2f} MB')
+    if skipped:
+        print(f'  已不存在跳过: {len(skipped):,} 个 (数据库记录已同步清理)')
+    if failed:
+        print(f'  删除失败:     {len(failed):,} 个 (通常为文件被占用或路径过长)')
+        for p, err in failed[:20]:
+            print(f'    - {p}: {err}')
+        if len(failed) > 20:
+            print(f'    ... 以及另外 {len(failed) - 20:,} 个失败项')
+    print('=' * 60)
 
 # ----------------------------- 目录遍历 -----------------------------
 
@@ -1126,6 +1369,7 @@ def menu(db_path):
         print(' [5] 优化与清理数据库 (VACUUM 整理碎片 & 索引优化)')
         print(f' [6] 切换错误处理模式 (当前: {"自动跳过" if auto_skip_errors else "暂停重试"})')
         print(' [7] 清理 Mac 垃圾文件 (删除扫描目录中的 ._*.xxx 与 .DS_Store, 删除前需确认)')
+        print(' [8] 删除重复文件 (每组保留 1 个: 体积最大>日期最新>文件名最大; 移入回收站)')
         print(' [0] 退出')
         choice = input('请选择: ').strip()
 
@@ -1205,6 +1449,15 @@ def menu(db_path):
                 export_report(conn, os.path.dirname(os.path.abspath(db_path)) or '.', echo=True)
             finally:
                 conn.close()
+        elif choice == '8':
+            conn = open_db(os.path.abspath(db_path))
+            try:
+                delete_duplicates(conn, db_path)
+            except KeyboardInterrupt:
+                print('\n删除已中断。')
+            finally:
+                conn.close()
+            continue
         else:
             print('无效选项。')
 
