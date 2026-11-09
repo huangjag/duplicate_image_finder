@@ -15,6 +15,8 @@ duplicates_report.csv
 duplicates_report.md
 duplicates.txt
 report.txt
+duplicates_report_temp.csv
+duplicates_report_temp.md
 
 # Virtual environments
 .venv/
@@ -33,3 +35,5 @@ wheels/
 Thumbs.db
 [Dd]esktop.ini
 .DS_Store
+*.csv
+*.md
